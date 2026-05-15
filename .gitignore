@@ -1,0 +1,31 @@
+# Virtual environments
+venv/
+env/
+
+# Environment files
+.env
+.env.local
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# SQLite database
+db.sqlite3
+
+# Static and media
+staticfiles/
+media/
+
+# Log files
+*.log
+runserver.err.log
+runserver.out.log
+startprocess-check.err.log
+startprocess-check.out.log
+
+# IDE files
+.vscode/
+.idea/
