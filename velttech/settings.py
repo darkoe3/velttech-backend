@@ -30,8 +30,6 @@ ALLOWED_HOSTS = [
     "api.velttech.org",
     "velttech-backend.onrender.com",
     ".onrender.com",
-    "localhost",
-    "127.0.0.1",
 ]
 
 CORS_ALLOWED_ORIGINS = [
