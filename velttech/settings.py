@@ -26,7 +26,13 @@ SECRET_KEY = 'django-insecure-(+vxj+@!(-m^k-!i8lt3lz9)!%=4bipy-dbza+71d08a@7o^z1
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = False
 
-ALLOWED_HOSTS = ["api.velttech.org",'localhost', '127.0.0.1',]
+ALLOWED_HOSTS = [
+    "api.velttech.org",
+    "velttech-backend.onrender.com",
+    ".onrender.com",
+    "localhost",
+    "127.0.0.1",
+]
 
 CORS_ALLOWED_ORIGINS = [
      "https://velttech.org",
