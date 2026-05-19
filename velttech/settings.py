@@ -88,6 +88,9 @@ EMAIL_USE_TLS = True
 EMAIL_HOST_USER = "resend"
 EMAIL_HOST_PASSWORD = os.getenv("RESEND_API_KEY") or os.getenv("EMAIL_HOST_PASSWORD")
 DEFAULT_FROM_EMAIL = "Velttech <noreply@velttech.org>"
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")
+PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY", "")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://velttech.org")
 
 # MIDDLEWARE
 MIDDLEWARE = [

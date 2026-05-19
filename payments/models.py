@@ -7,12 +7,14 @@ class Payment(models.Model):
     METHOD_MOBILE_MONEY = 'mobile_money'
     METHOD_CARD = 'card'
     METHOD_BANK_TRANSFER = 'bank_transfer'
+    METHOD_PAYSTACK = 'paystack'
 
     METHOD_CHOICES = [
         (METHOD_CASH, 'Cash'),
         (METHOD_MOBILE_MONEY, 'Mobile Money'),
         (METHOD_CARD, 'Card'),
         (METHOD_BANK_TRANSFER, 'Bank Transfer'),
+        (METHOD_PAYSTACK, 'Paystack'),
     ]
 
     STATUS_PENDING = 'pending'

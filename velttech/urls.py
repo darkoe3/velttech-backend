@@ -22,7 +22,12 @@ from rest_framework_simplejwt.views import TokenRefreshView
 
 from courses.views import CourseViewSet
 from enrollments.views import EnrollmentViewSet
-from payments.views import PaymentViewSet
+from payments.views import (
+    PaymentViewSet,
+    PaystackInitializePaymentView,
+    PaystackVerifyPaymentView,
+    PaystackWebhookView,
+)
 from students.views import ParentViewSet, StudentViewSet
 from users.views import (
     AdminApproveStudentView,
@@ -111,6 +116,9 @@ urlpatterns = [
     path('api/my-children/', MyChildrenView.as_view(), name='my-children'),
     path('api/my-payments/', MyPaymentsView.as_view(), name='my_payments'),
     path('api/my-payments/history/', MyPaymentHistoryView.as_view(), name='my_payments_history'),
+    path('api/payments/initialize/', PaystackInitializePaymentView.as_view(), name='paystack-initialize'),
+    path('api/payments/verify/', PaystackVerifyPaymentView.as_view(), name='paystack-verify'),
+    path('api/payments/paystack-webhook/', PaystackWebhookView.as_view(), name='paystack-webhook'),
     path('api/my-attendance/', MyAttendanceView.as_view(), name='my_attendance'),
     path('api/my-progress/', MyProgressView.as_view(), name='my_progress'),
     path('api/my-assignments/', MyAssignmentsView.as_view(), name='my_assignments'),

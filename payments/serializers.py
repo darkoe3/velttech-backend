@@ -9,6 +9,7 @@ class PaymentSerializer(serializers.ModelSerializer):
     enrollment_detail = EnrollmentSerializer(source='enrollment', read_only=True)
     student_name = serializers.SerializerMethodField()
     parent_name = serializers.SerializerMethodField()
+    parent_email = serializers.SerializerMethodField()
     course_title = serializers.CharField(source='enrollment.course.title', read_only=True)
     reference = serializers.CharField(source='transaction_reference', read_only=True)
     balance = serializers.SerializerMethodField()
@@ -23,6 +24,7 @@ class PaymentSerializer(serializers.ModelSerializer):
             'amount',
             'student_name',
             'parent_name',
+            'parent_email',
             'course_title',
             'payment_method',
             'status',
@@ -46,6 +48,10 @@ class PaymentSerializer(serializers.ModelSerializer):
 
     def get_parent_name(self, obj):
         return str(obj.enrollment.student.parent) if obj.enrollment.student.parent else ''
+
+    def get_parent_email(self, obj):
+        parent = obj.enrollment.student.parent
+        return parent.email if parent else ''
 
     def get_balance(self, obj):
         return max(obj.enrollment.course.monthly_fee - obj.amount, 0)
@@ -75,4 +81,5 @@ class PaymentHistorySerializer(serializers.Serializer):
     payment_method = serializers.CharField(allow_blank=True)
     reference = serializers.CharField(allow_blank=True)
     payment_date = serializers.DateField(allow_null=True)
+    paid_at = serializers.DateTimeField(allow_null=True)
     receipt_number = serializers.CharField(allow_blank=True)

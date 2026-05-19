@@ -530,30 +530,33 @@ def build_payment_history_rows(enrollments):
 
         for period in month_sequence(start, min(end, today)):
             period_payments = payments_by_period.get((enrollment.id, period.year, period.month), [])
-            completed_payments = [
+            paid_payments = [
                 payment
                 for payment in period_payments
                 if payment.status == Payment.STATUS_PAID
             ]
             expected_amount = enrollment.course.monthly_fee
             amount_paid = sum(
-                (payment.amount for payment in completed_payments),
+                (payment.amount for payment in paid_payments),
                 Decimal('0.00'),
             )
             balance = max(expected_amount - amount_paid, Decimal('0.00'))
+
+            latest_payment = sorted(
+                period_payments,
+                key=lambda item: item.payment_date
+                or (item.paid_at.date() if item.paid_at else item.created_at.date()),
+                reverse=True,
+            )[0] if period_payments else None
+
             if amount_paid >= expected_amount:
                 payment_status = 'paid'
+            elif latest_payment and latest_payment.status in [Payment.STATUS_PENDING, Payment.STATUS_FAILED]:
+                payment_status = latest_payment.status
             elif amount_paid > 0:
                 payment_status = 'partial'
             else:
                 payment_status = 'unpaid'
-
-            latest_payment = sorted(
-                completed_payments,
-                key=lambda item: item.payment_date
-                or (item.paid_at.date() if item.paid_at else item.created_at.date()),
-                reverse=True,
-            )[0] if completed_payments else None
 
             rows.append(
                 {
@@ -575,6 +578,7 @@ def build_payment_history_rows(enrollments):
                         latest_payment.payment_date
                         or (latest_payment.paid_at.date() if latest_payment.paid_at else None)
                     ) if latest_payment else None,
+                    'paid_at': latest_payment.paid_at if latest_payment else None,
                     'receipt_number': latest_payment.receipt_number if latest_payment else '',
                 }
             )
