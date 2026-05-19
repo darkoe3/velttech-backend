@@ -80,7 +80,14 @@ SIMPLE_JWT = {
     "UPDATE_LAST_LOGIN": True,
     "AUTH_HEADER_TYPES": ("Bearer",),
 }
-
+#Email settings
+EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+EMAIL_HOST = "smtp.resend.com"
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = "resend"
+EMAIL_HOST_PASSWORD = os.getenv("RESEND_API_KEY") or os.getenv("EMAIL_HOST_PASSWORD")
+DEFAULT_FROM_EMAIL = "Velttech <noreply@velttech.org>"
 
 # MIDDLEWARE
 MIDDLEWARE = [

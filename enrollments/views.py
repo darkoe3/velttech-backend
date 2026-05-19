@@ -45,3 +45,9 @@ class EnrollmentViewSet(viewsets.ModelViewSet):
         if user.role == 'instructor':
             return queryset.filter(instructor=user)
         return queryset.none()
+
+    def perform_create(self, serializer):
+        enrollment = serializer.save()
+        from users.views import log_admin_action
+        if self.request.user.role == 'admin':
+            log_admin_action(self.request, 'enrollment_created', f'Created enrollment for {enrollment.student} in {enrollment.course}.')

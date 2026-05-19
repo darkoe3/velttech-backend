@@ -1,4 +1,4 @@
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 
 
@@ -16,15 +16,13 @@ class Payment(models.Model):
     ]
 
     STATUS_PENDING = 'pending'
-    STATUS_COMPLETED = 'completed'
+    STATUS_PAID = 'paid'
     STATUS_FAILED = 'failed'
-    STATUS_REFUNDED = 'refunded'
 
     STATUS_CHOICES = [
         (STATUS_PENDING, 'Pending'),
-        (STATUS_COMPLETED, 'Completed'),
+        (STATUS_PAID, 'Paid'),
         (STATUS_FAILED, 'Failed'),
-        (STATUS_REFUNDED, 'Refunded'),
     ]
 
     enrollment = models.ForeignKey(
@@ -62,15 +60,17 @@ class Payment(models.Model):
 
     def save(self, *args, **kwargs):
         if not self.receipt_number:
-            receipt_year = self.year or (
-                self.payment_date.year if self.payment_date else timezone.localdate().year
-            )
-            prefix = f'VTA-{receipt_year}-'
-            last_payment = Payment.objects.filter(
-                receipt_number__startswith=prefix,
-            ).order_by('-receipt_number').first()
-            last_sequence = int(last_payment.receipt_number.split('-')[-1]) if last_payment else 0
-            self.receipt_number = f'{prefix}{last_sequence + 1:06d}'
+            with transaction.atomic():
+                receipt_year = self.year or (
+                    self.payment_date.year if self.payment_date else timezone.localdate().year
+                )
+                prefix = f'VTA-{receipt_year}-'
+                last_payment = Payment.objects.select_for_update().filter(
+                    receipt_number__startswith=prefix,
+                ).order_by('-receipt_number').first()
+                last_sequence = int(last_payment.receipt_number.split('-')[-1]) if last_payment else 0
+                self.receipt_number = f'{prefix}{last_sequence + 1:06d}'
+                return super().save(*args, **kwargs)
         super().save(*args, **kwargs)
 
 # Create your models here.

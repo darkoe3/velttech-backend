@@ -1,8 +1,11 @@
 from datetime import date
 from decimal import Decimal
+import logging
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
+from django.conf import settings
+from django.core.mail import send_mail
 from django.utils.encoding import force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from django.utils.encoding import force_bytes
@@ -63,6 +66,7 @@ from enrollments.serializers import (
 )
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 class IsAdminUserRole(permissions.BasePermission):
@@ -171,6 +175,42 @@ def log_admin_action(request, action, description):
     )
 
 
+def student_course_summary(student):
+    course_titles = [
+        enrollment.course.title
+        for enrollment in student.enrollments.select_related('course').all()
+    ]
+    return ', '.join(course_titles) if course_titles else 'To be assigned by the academy'
+
+
+def send_student_approval_email(student):
+    if not student.parent or not student.parent.email:
+        return
+
+    parent_name = str(student.parent)
+    child_name = str(student)
+    course_summary = student_course_summary(student)
+    message = (
+        f'Dear {parent_name},\n\n'
+        f'Your child, {child_name}, has been approved for Velttech Coding Academy.\n\n'
+        f'Approved course: {course_summary}\n\n'
+        'Next steps:\n'
+        '1. Watch for class schedule and onboarding updates from our team.\n'
+        '2. Review your payment history and receipts from your parent dashboard.\n'
+        '3. Contact us if any child or parent details need to be updated.\n\n'
+        'Velttech Coding Academy\n'
+        'Email: info@velttech.org\n'
+        'Website: https://velttech.org\n'
+    )
+    send_mail(
+        subject='Your Child Has Been Approved - Velttech Coding Academy',
+        message=message,
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        recipient_list=[student.parent.email],
+        fail_silently=False,
+    )
+
+
 def visible_notifications_for(user):
     if user.role == User.ROLE_ADMIN:
         return Notification.objects.all()
@@ -227,19 +267,31 @@ class DashboardView(APIView):
         if user.role == User.ROLE_ADMIN:
             recent_registrations = User.objects.order_by('-date_joined')[:5]
             recent_payments = visible_payments_for(user).order_by('-created_at')[:5]
-            monthly = Payment.objects.filter(status=Payment.STATUS_COMPLETED).annotate(
+            today = timezone.localdate()
+            paid_payments = Payment.objects.filter(status=Payment.STATUS_PAID)
+            monthly = paid_payments.annotate(
                 month_number=ExtractMonth('created_at')
             ).values('month_number').annotate(total=Sum('amount')).order_by('month_number')
+            total_paid_amount = paid_payments.aggregate(total=Sum('amount'))['total'] or 0
+            current_month_revenue = paid_payments.filter(
+                created_at__year=today.year,
+                created_at__month=today.month,
+            ).aggregate(total=Sum('amount'))['total'] or 0
             month_names = ['January','February','March','April','May','June','July','August','September','October','November','December']
             return Response(
                 {
                     'role': user.role,
                     'summary': {
                         'total_students': Student.objects.count(),
+                        'approved_students': Student.objects.filter(approval_status=Student.STATUS_APPROVED).count(),
+                        'pending_approvals': Student.objects.filter(approval_status=Student.STATUS_PENDING).count(),
                         'total_parents': Parent.objects.count(),
                         'total_courses': Course.objects.count(),
                         'total_enrollments': Enrollment.objects.count(),
                         'total_payments': Payment.objects.count(),
+                        'total_paid_amount': total_paid_amount,
+                        'current_month_revenue': current_month_revenue,
+                        'pending_payments': Payment.objects.filter(status=Payment.STATUS_PENDING).count(),
                         'total_instructors': User.objects.filter(role=User.ROLE_INSTRUCTOR).count(),
                     },
                     'pending_children': DashboardChildSerializer(
@@ -289,6 +341,10 @@ class DashboardView(APIView):
                         {'course': item['course__title'], 'count': item['count']}
                         for item in Enrollment.objects.values('course__title').annotate(count=Count('id'))
                     ],
+                    'latest_activity_logs': ActivityLogSerializer(
+                        ActivityLog.objects.select_related('user')[:6],
+                        many=True,
+                    ).data,
                 }
             )
 
@@ -299,11 +355,11 @@ class DashboardView(APIView):
             payments = visible_payments_for(user)
             payment_summary = payments.aggregate(
                 total=Count('id'),
-                completed=Count('id', filter=Q(status=Payment.STATUS_COMPLETED)),
+                completed=Count('id', filter=Q(status=Payment.STATUS_PAID)),
                 pending=Count('id', filter=Q(status=Payment.STATUS_PENDING)),
                 completed_amount=Sum(
                     'amount',
-                    filter=Q(status=Payment.STATUS_COMPLETED),
+                    filter=Q(status=Payment.STATUS_PAID),
                 ),
             )
             return Response(
@@ -477,7 +533,7 @@ def build_payment_history_rows(enrollments):
             completed_payments = [
                 payment
                 for payment in period_payments
-                if payment.status == Payment.STATUS_COMPLETED
+                if payment.status == Payment.STATUS_PAID
             ]
             expected_amount = enrollment.course.monthly_fee
             amount_paid = sum(
@@ -599,6 +655,11 @@ class AdminApproveStudentView(APIView):
         student = generics.get_object_or_404(Student, pk=pk)
         student.approval_status = Student.STATUS_APPROVED
         student.save(update_fields=['approval_status', 'updated_at'])
+        try:
+            send_student_approval_email(student)
+        except Exception:
+            logger.exception('Could not send approval email for student %s.', student.pk)
+            log_admin_action(request, 'approval_email_failed', f'Could not send approval email for {student}.')
         if student.parent and student.parent.user:
             Notification.objects.create(
                 title='Child approved',

@@ -7,10 +7,12 @@ from .models import Payment
 class PaymentAdmin(admin.ModelAdmin):
     list_display = (
         'enrollment',
+        'receipt_number',
         'amount',
         'payment_method',
         'status',
         'transaction_reference',
+        'receipt_number',
         'month',
         'year',
         'payment_date',

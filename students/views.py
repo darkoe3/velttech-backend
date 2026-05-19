@@ -22,7 +22,7 @@ class ParentViewSet(viewsets.ModelViewSet):
 
 
 class StudentViewSet(viewsets.ModelViewSet):
-    queryset = Student.objects.select_related('parent')
+    queryset = Student.objects.select_related('parent').prefetch_related('enrollments__course')
     serializer_class = StudentSerializer
     permission_classes = [IsAuthenticated, IsAdminOrReadOnly]
 
@@ -39,6 +39,8 @@ class StudentViewSet(viewsets.ModelViewSet):
                     Q(first_name__icontains=search)
                     | Q(other_name__icontains=search)
                     | Q(last_name__icontains=search)
+                    | Q(email__icontains=search)
+                    | Q(parent__email__icontains=search)
                 )
             if approval_status:
                 queryset = queryset.filter(approval_status=approval_status)

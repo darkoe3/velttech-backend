@@ -38,10 +38,11 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
 
 class ActivityLogSerializer(serializers.ModelSerializer):
     user_email = serializers.CharField(source='user.email', read_only=True)
+    timestamp = serializers.DateTimeField(source='created_at', read_only=True)
 
     class Meta:
         model = ActivityLog
-        fields = ['id', 'user', 'user_email', 'role', 'action', 'description', 'ip_address', 'created_at']
+        fields = ['id', 'user', 'user_email', 'role', 'action', 'description', 'ip_address', 'created_at', 'timestamp']
 
 
 class DashboardCourseSerializer(serializers.ModelSerializer):
@@ -105,6 +106,7 @@ class DashboardPaymentSerializer(serializers.ModelSerializer):
             'amount',
             'payment_method',
             'status',
+            'receipt_number',
             'transaction_reference',
             'paid_at',
             'created_at',
