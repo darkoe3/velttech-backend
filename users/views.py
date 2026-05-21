@@ -6,6 +6,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.conf import settings
 from django.core.mail import send_mail
+from django.db import transaction
 from django.utils.encoding import force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from django.utils.encoding import force_bytes
@@ -183,23 +184,80 @@ def student_course_summary(student):
     return ', '.join(course_titles) if course_titles else 'To be assigned by the academy'
 
 
-def send_student_approval_email(student):
+def course_invoice_fee(course):
+    fee = getattr(course, 'fee', None)
+    if fee:
+        return fee
+    return getattr(course, 'monthly_fee', Decimal('0.00')) or Decimal('0.00')
+
+
+def create_pending_invoice_for_enrollment(enrollment):
+    enrollment = Enrollment.objects.select_related(
+        'student',
+        'student__parent',
+        'course',
+    ).select_for_update().get(pk=enrollment.pk)
+    existing_payment = Payment.objects.filter(
+        enrollment__student=enrollment.student,
+        enrollment__course=enrollment.course,
+        status__in=[Payment.STATUS_PENDING, Payment.STATUS_PAID],
+    ).first()
+    if existing_payment:
+        return existing_payment, False
+
+    today = timezone.localdate()
+    payment = Payment.objects.create(
+        enrollment=enrollment,
+        amount=course_invoice_fee(enrollment.course),
+        payment_method=Payment.METHOD_PENDING,
+        status=Payment.STATUS_PENDING,
+        month=today.month,
+        year=today.year,
+        notes='Automatically generated when student was approved or enrolled.',
+    )
+    return payment, True
+
+
+def approval_invoice_for_student(student):
+    enrollment = student.enrollments.select_related('course').order_by('-created_at').first()
+    if not enrollment:
+        return None, False
+    with transaction.atomic():
+        return create_pending_invoice_for_enrollment(enrollment)
+
+
+def format_invoice_amount(payment):
+    return f'GHS {payment.amount:,.2f}' if payment else 'GHS 0.00'
+
+
+def send_student_approval_email(student, payment=None):
     if not student.parent or not student.parent.email:
-        return
+        return False
 
     parent_name = str(student.parent)
     child_name = str(student)
-    course_summary = student_course_summary(student)
+    course_summary = payment.enrollment.course.title if payment else student_course_summary(student)
+    course_fee = format_invoice_amount(payment) if payment else 'To be confirmed by the academy'
     message = (
         f'Dear {parent_name},\n\n'
         f'Your child, {child_name}, has been approved for Velttech Coding Academy.\n\n'
         f'Approved course: {course_summary}\n\n'
-        'Next steps:\n'
-        '1. Watch for class schedule and onboarding updates from our team.\n'
-        '2. Review your payment history and receipts from your parent dashboard.\n'
-        '3. Contact us if any child or parent details need to be updated.\n\n'
-        'Velttech Coding Academy\n'
+        f'Course fee: {course_fee}\n'
+        'Login link: https://velttech.org/login\n\n'
+        'Please log in to your parent portal to complete payment.\n'
+    )
+    if payment:
+        message += (
+            f'Invoice amount: {format_invoice_amount(payment)}\n'
+            'Payment status: Pending\n'
+            'Click Pay Now in the parent dashboard to complete payment.\n'
+            'Parent portal: https://velttech.org/payments\n\n'
+        )
+    message += (
+        'Contact:\n'
         'Email: info@velttech.org\n'
+        'Phone: +233 55 510 6820\n\n'
+        'Velttech Coding Academy\n'
         'Website: https://velttech.org\n'
     )
     send_mail(
@@ -209,6 +267,30 @@ def send_student_approval_email(student):
         recipient_list=[student.parent.email],
         fail_silently=False,
     )
+    return True
+
+
+def send_admin_invoice_notification(student, payment):
+    if not payment:
+        return False
+    parent = student.parent
+    message = (
+        'A student has been approved and an invoice has been created.\n\n'
+        f'Parent: {parent or "Not provided"}\n'
+        f'Parent email: {parent.email if parent else "Not provided"}\n'
+        f'Child: {student}\n'
+        f'Course: {payment.enrollment.course.title}\n'
+        f'Amount: {format_invoice_amount(payment)}\n'
+        f'Payment status: {payment.status.title()}\n'
+    )
+    send_mail(
+        subject='New Student Approved and Invoice Created',
+        message=message,
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        recipient_list=['info@velttech.org'],
+        fail_silently=False,
+    )
+    return True
 
 
 def visible_notifications_for(user):
@@ -361,6 +443,13 @@ class DashboardView(APIView):
                     'amount',
                     filter=Q(status=Payment.STATUS_PAID),
                 ),
+                outstanding_amount=Sum(
+                    'amount',
+                    filter=Q(status=Payment.STATUS_PENDING),
+                ),
+            )
+            pending_payment_ids = list(
+                payments.filter(status=Payment.STATUS_PENDING).values_list('id', flat=True)
             )
             return Response(
                 {
@@ -371,6 +460,8 @@ class DashboardView(APIView):
                         'completed': payment_summary['completed'] or 0,
                         'pending': payment_summary['pending'] or 0,
                         'completed_amount': payment_summary['completed_amount'] or 0,
+                        'outstanding_amount': payment_summary['outstanding_amount'] or 0,
+                        'pending_payment_ids': pending_payment_ids,
                     },
                     'recent_payments': DashboardPaymentSerializer(
                         payments.order_by('-created_at')[:5],
@@ -535,7 +626,7 @@ def build_payment_history_rows(enrollments):
                 for payment in period_payments
                 if payment.status == Payment.STATUS_PAID
             ]
-            expected_amount = enrollment.course.monthly_fee
+            expected_amount = course_invoice_fee(enrollment.course)
             amount_paid = sum(
                 (payment.amount for payment in paid_payments),
                 Decimal('0.00'),
@@ -549,10 +640,12 @@ def build_payment_history_rows(enrollments):
                 reverse=True,
             )[0] if period_payments else None
 
-            if amount_paid >= expected_amount:
-                payment_status = 'paid'
-            elif latest_payment and latest_payment.status in [Payment.STATUS_PENDING, Payment.STATUS_FAILED]:
+            if latest_payment and latest_payment.status in [Payment.STATUS_PENDING, Payment.STATUS_FAILED]:
                 payment_status = latest_payment.status
+            elif expected_amount == 0 and not paid_payments:
+                payment_status = 'unpaid'
+            elif amount_paid >= expected_amount:
+                payment_status = 'paid'
             elif amount_paid > 0:
                 payment_status = 'partial'
             else:
@@ -656,23 +749,64 @@ class AdminApproveStudentView(APIView):
     permission_classes = [permissions.IsAuthenticated, IsAdminUserRole]
 
     def post(self, request, pk):
-        student = generics.get_object_or_404(Student, pk=pk)
+        student = generics.get_object_or_404(
+            Student.objects.select_related('parent', 'parent__user').prefetch_related('enrollments__course'),
+            pk=pk,
+        )
+        was_already_approved = student.approval_status == Student.STATUS_APPROVED
         student.approval_status = Student.STATUS_APPROVED
         student.save(update_fields=['approval_status', 'updated_at'])
+        log_admin_action(request, 'student_approved', f'Student approved: {student}.')
+
+        payment = None
+        invoice_created = False
         try:
-            send_student_approval_email(student)
+            payment, invoice_created = approval_invoice_for_student(student)
+            if payment and invoice_created:
+                log_admin_action(
+                    request,
+                    'invoice_created',
+                    f'Invoice created for {student} in {payment.enrollment.course}: {payment.receipt_number}.',
+                )
         except Exception:
-            logger.exception('Could not send approval email for student %s.', student.pk)
-            log_admin_action(request, 'approval_email_failed', f'Could not send approval email for {student}.')
-        if student.parent and student.parent.user:
+            logger.exception('Could not create approval invoice for student %s.', student.pk)
+            log_admin_action(request, 'invoice_creation_failed', f'Could not create invoice for {student}.')
+
+        email_sent = False
+        if not was_already_approved or invoice_created:
+            try:
+                email_sent = send_student_approval_email(student, payment)
+                if email_sent:
+                    log_admin_action(request, 'approval_email_sent', f'Approval email sent for {student}.')
+            except Exception:
+                logger.exception('Could not send approval email for student %s.', student.pk)
+                log_admin_action(request, 'approval_email_failed', f'Could not send approval email for {student}.')
+
+        if payment and invoice_created:
+            try:
+                send_admin_invoice_notification(student, payment)
+            except Exception:
+                logger.exception('Could not send admin invoice notification for student %s.', student.pk)
+
+        if student.parent and student.parent.user and (not was_already_approved or invoice_created):
             Notification.objects.create(
                 title='Child approved',
-                message=f'Your child {student} has been approved by Velttech Coding Academy.',
+                message=(
+                    f'Your child {student} has been approved by Velttech Coding Academy.'
+                    + (' A pending invoice is ready in your payment portal.' if payment else '')
+                ),
                 audience=Notification.AUDIENCE_PARENTS,
                 recipient=student.parent.user,
             )
-        log_admin_action(request, 'student_approved', f'Approved student {student}.')
-        return Response(DashboardChildSerializer(student).data)
+        return Response(
+            {
+                'message': 'Student approved successfully.',
+                'invoice_created': invoice_created,
+                'payment_id': payment.id if payment else None,
+                'email_sent': email_sent,
+                'student': DashboardChildSerializer(student).data,
+            }
+        )
 
 
 class AdminRejectStudentView(APIView):
@@ -700,6 +834,37 @@ class AdminEnrollmentCreateView(generics.CreateAPIView):
     def perform_create(self, serializer):
         enrollment = serializer.save()
         log_admin_action(self.request, 'enrollment_created', f'Created enrollment for {enrollment.student} in {enrollment.course}.')
+        if enrollment.student.approval_status != Student.STATUS_APPROVED:
+            return
+
+        payment = None
+        invoice_created = False
+        try:
+            with transaction.atomic():
+                payment, invoice_created = create_pending_invoice_for_enrollment(enrollment)
+            if invoice_created:
+                log_admin_action(
+                    self.request,
+                    'invoice_created',
+                    f'Invoice created for {enrollment.student} in {enrollment.course}: {payment.receipt_number}.',
+                )
+        except Exception:
+            logger.exception('Could not create enrollment invoice for enrollment %s.', enrollment.pk)
+            log_admin_action(self.request, 'invoice_creation_failed', f'Could not create invoice for {enrollment.student}.')
+            return
+
+        if invoice_created:
+            try:
+                email_sent = send_student_approval_email(enrollment.student, payment)
+                if email_sent:
+                    log_admin_action(self.request, 'approval_email_sent', f'Approval email sent for {enrollment.student}.')
+            except Exception:
+                logger.exception('Could not send invoice email for student %s.', enrollment.student_id)
+                log_admin_action(self.request, 'approval_email_failed', f'Could not send approval email for {enrollment.student}.')
+            try:
+                send_admin_invoice_notification(enrollment.student, payment)
+            except Exception:
+                logger.exception('Could not send admin invoice notification for student %s.', enrollment.student_id)
 
 
 class AdminActivityLogView(generics.ListAPIView):

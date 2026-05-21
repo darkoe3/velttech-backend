@@ -12,5 +12,6 @@ class CourseSerializer(serializers.ModelSerializer):
             'description',
             'duration_months',
             'monthly_fee',
+            'fee',
             'is_active',
         ]

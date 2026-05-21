@@ -3,6 +3,7 @@ from django.utils import timezone
 
 
 class Payment(models.Model):
+    METHOD_PENDING = 'pending'
     METHOD_CASH = 'cash'
     METHOD_MOBILE_MONEY = 'mobile_money'
     METHOD_CARD = 'card'
@@ -10,6 +11,7 @@ class Payment(models.Model):
     METHOD_PAYSTACK = 'paystack'
 
     METHOD_CHOICES = [
+        (METHOD_PENDING, 'Pending'),
         (METHOD_CASH, 'Cash'),
         (METHOD_MOBILE_MONEY, 'Mobile Money'),
         (METHOD_CARD, 'Card'),
@@ -33,7 +35,12 @@ class Payment(models.Model):
         related_name='payments',
     )
     amount = models.DecimalField(max_digits=10, decimal_places=2)
-    payment_method = models.CharField(max_length=20, choices=METHOD_CHOICES)
+    payment_method = models.CharField(
+        max_length=20,
+        choices=METHOD_CHOICES,
+        blank=True,
+        default=METHOD_PENDING,
+    )
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,

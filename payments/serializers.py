@@ -5,6 +5,13 @@ from enrollments.serializers import EnrollmentSerializer
 from .models import Payment
 
 
+def course_fee(course):
+    fee = getattr(course, 'fee', None)
+    if fee:
+        return fee
+    return course.monthly_fee
+
+
 class PaymentSerializer(serializers.ModelSerializer):
     enrollment_detail = EnrollmentSerializer(source='enrollment', read_only=True)
     student_name = serializers.SerializerMethodField()
@@ -54,10 +61,13 @@ class PaymentSerializer(serializers.ModelSerializer):
         return parent.email if parent else ''
 
     def get_balance(self, obj):
-        return max(obj.enrollment.course.monthly_fee - obj.amount, 0)
+        paid_amount = obj.amount if obj.status == Payment.STATUS_PAID else 0
+        return max(course_fee(obj.enrollment.course) - paid_amount, 0)
 
     def get_payment_status(self, obj):
-        expected = obj.enrollment.course.monthly_fee
+        if obj.status in [Payment.STATUS_PENDING, Payment.STATUS_FAILED]:
+            return obj.status
+        expected = course_fee(obj.enrollment.course)
         if obj.amount >= expected:
             return 'paid'
         if obj.amount > 0:
