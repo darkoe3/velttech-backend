@@ -10,32 +10,47 @@ import dj_database_url
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
+def env_bool(name, default=False):
+    return os.getenv(name, str(default)).lower() in {"1", "true", "yes", "on"}
+
+
+def env_list(name, default):
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 # SECURITY
 SECRET_KEY = os.getenv("SECRET_KEY", "unsafe-dev-secret-key")
 
-DEBUG = os.getenv("DEBUG", "False") == "True"
+DEBUG = env_bool("DEBUG", True)
 
-ALLOWED_HOSTS = [
+if env_bool("REQUIRE_PRODUCTION_SECRETS", False) and SECRET_KEY == "unsafe-dev-secret-key":
+    raise RuntimeError("SECRET_KEY must be configured in production.")
+
+ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", [
     "api.velttech.org",
     "velttech-backend.onrender.com",
     ".onrender.com",
     "localhost",
     "127.0.0.1",
-]
+])
 
 
 # CORS / CSRF
-CORS_ALLOWED_ORIGINS = [
+CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS", [
     "https://velttech.org",
     "https://www.velttech.org",
     "http://localhost:3000",
-]
+])
+CORS_ALLOW_CREDENTIALS = True
 
-CSRF_TRUSTED_ORIGINS = [
+CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS", [
     "https://velttech.org",
     "https://www.velttech.org",
     "https://api.velttech.org",
-]
+])
 
 
 # APPLICATIONS
@@ -179,6 +194,19 @@ STORAGES = {
 
 # SECURITY BEHIND RENDER PROXY
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+SECURE_SSL_REDIRECT = env_bool("SECURE_SSL_REDIRECT", not DEBUG)
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+SESSION_COOKIE_HTTPONLY = True
+CSRF_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
+SECURE_HSTS_SECONDS = int(os.getenv("SECURE_HSTS_SECONDS", "31536000" if not DEBUG else "0"))
+SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool("SECURE_HSTS_INCLUDE_SUBDOMAINS", not DEBUG)
+SECURE_HSTS_PRELOAD = env_bool("SECURE_HSTS_PRELOAD", not DEBUG)
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+X_FRAME_OPTIONS = "DENY"
 
 
 # DEFAULT PRIMARY KEY FIELD TYPE

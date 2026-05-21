@@ -5,6 +5,7 @@ from secrets import token_hex
 
 import requests
 from django.conf import settings
+from django.core.mail import send_mail
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -18,9 +19,12 @@ from users.permissions import IsAdminOrReadOnly
 
 
 PAYSTACK_BASE_URL = 'https://api.paystack.co/transaction'
+PAYSTACK_CURRENCY = 'GHS'
 
 
 def user_can_access_payment(user, payment):
+    if getattr(user, 'approval_status', 'approved') != 'approved':
+        return False
     if user.role == 'admin':
         return True
     if user.role == 'parent':
@@ -56,7 +60,31 @@ def paystack_headers():
     }
 
 
+def parse_paystack_json(response):
+    try:
+        return response.json()
+    except ValueError:
+        return {}
+
+
+def expected_paystack_amount(payment):
+    return int(payment.amount * Decimal('100'))
+
+
+def paystack_charge_matches_payment(payment, paystack_data):
+    metadata = paystack_data.get('metadata') or {}
+    metadata_payment_id = metadata.get('payment_id')
+    if metadata_payment_id and str(metadata_payment_id) != str(payment.id):
+        return False
+    return (
+        paystack_data.get('reference') == payment.transaction_reference
+        and paystack_data.get('currency') == PAYSTACK_CURRENCY
+        and int(paystack_data.get('amount') or 0) == expected_paystack_amount(payment)
+    )
+
+
 def mark_payment_paid(payment):
+    was_paid = payment.status == Payment.STATUS_PAID
     payment.status = Payment.STATUS_PAID
     payment.payment_method = Payment.METHOD_PAYSTACK
     payment.paid_at = payment.paid_at or timezone.now()
@@ -69,7 +97,43 @@ def mark_payment_paid(payment):
         'receipt_number',
         'updated_at',
     ])
+    if not was_paid:
+        send_payment_receipt_email(payment)
     return payment
+
+
+def send_payment_receipt_email(payment):
+    email = payment_email(payment)
+    if not email:
+        return False
+    try:
+        send_mail(
+            subject='Your Velttech Academy Payment Receipt',
+            message=(
+                'Thank you for your payment to Velttech Coding Academy.\n\n'
+                f'Receipt number: {payment.receipt_number}\n'
+                f'Learner: {payment.enrollment.student}\n'
+                f'Course: {payment.enrollment.course.title}\n'
+                f'Amount: GHS {payment.amount:,.2f}\n'
+                f'Payment status: {payment.status.title()}\n'
+                f'Paid at: {payment.paid_at}\n\n'
+                'You can view and print your receipt from your dashboard.\n\n'
+                'Velttech Coding Academy\n'
+                'Email: info@velttech.org\n'
+                'Phone: +233 55 510 6820\n'
+            ),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            fail_silently=False,
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception(
+            'Could not send payment receipt email for payment %s.',
+            payment.pk,
+        )
+        return False
+    return True
 
 
 def mark_payment_failed(payment):
@@ -134,6 +198,8 @@ class PaystackInitializePaymentView(APIView):
             raise PermissionDenied('You do not have access to this payment.')
         if payment.status == Payment.STATUS_PAID:
             raise ValidationError({'detail': 'This payment has already been paid.'})
+        if payment.amount <= 0:
+            raise ValidationError({'detail': 'Online payment requires a positive invoice amount.'})
 
         email = payment_email(payment)
         if not email:
@@ -147,7 +213,7 @@ class PaystackInitializePaymentView(APIView):
         payload = {
             'email': email,
             'amount': int(payment.amount * Decimal('100')),
-            'currency': 'GHS',
+            'currency': PAYSTACK_CURRENCY,
             'reference': payment.transaction_reference,
             'callback_url': callback_url,
             'metadata': {
@@ -163,7 +229,7 @@ class PaystackInitializePaymentView(APIView):
             headers=paystack_headers(),
             timeout=20,
         )
-        body = response.json()
+        body = parse_paystack_json(response)
         if not response.ok or not body.get('status'):
             mark_payment_failed(payment)
             return Response(
@@ -203,9 +269,14 @@ class PaystackVerifyPaymentView(APIView):
             headers=paystack_headers(),
             timeout=20,
         )
-        body = response.json()
+        body = parse_paystack_json(response)
         paystack_data = body.get('data', {})
-        if response.ok and body.get('status') and paystack_data.get('status') == 'success':
+        if (
+            response.ok
+            and body.get('status')
+            and paystack_data.get('status') == 'success'
+            and paystack_charge_matches_payment(payment, paystack_data)
+        ):
             mark_payment_paid(payment)
         elif response.ok and paystack_data.get('status') in ['failed', 'abandoned']:
             mark_payment_failed(payment)
@@ -240,8 +311,13 @@ class PaystackWebhookView(APIView):
         data = request.data.get('data') or {}
         reference = data.get('reference')
         if event == 'charge.success' and reference:
-            payment = Payment.objects.filter(transaction_reference=reference).first()
-            if payment:
+            payment = Payment.objects.select_related(
+                'enrollment',
+                'enrollment__student',
+                'enrollment__student__parent',
+                'enrollment__course',
+            ).filter(transaction_reference=reference).first()
+            if payment and paystack_charge_matches_payment(payment, data):
                 mark_payment_paid(payment)
 
         return Response({'detail': 'ok'})

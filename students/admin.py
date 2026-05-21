@@ -11,8 +11,18 @@ class ParentAdmin(admin.ModelAdmin):
 
 @admin.register(Student)
 class StudentAdmin(admin.ModelAdmin):
-    list_display = ('first_name', 'other_name', 'last_name', 'parent', 'approval_status', 'email', 'phone_number')
-    list_filter = ('approval_status', 'school_name')
+    list_display = (
+        'first_name',
+        'other_name',
+        'last_name',
+        'learner_type',
+        'programme_of_interest',
+        'parent',
+        'approval_status',
+        'email',
+        'phone_number',
+    )
+    list_filter = ('approval_status', 'learner_type', 'programme_of_interest', 'school_name')
     list_editable = ('approval_status',)
     search_fields = (
         'first_name',
@@ -26,7 +36,7 @@ class StudentAdmin(admin.ModelAdmin):
     )
     actions = ('approve_children',)
 
-    @admin.action(description='Approve selected children')
+    @admin.action(description='Approve selected learners')
     def approve_children(self, request, queryset):
         queryset.update(approval_status=Student.STATUS_APPROVED)
 

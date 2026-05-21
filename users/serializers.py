@@ -1,6 +1,7 @@
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 from students.models import Parent, Student
@@ -16,7 +17,7 @@ User = get_user_model()
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ['id', 'email', 'first_name', 'last_name', 'role']
+        fields = ['id', 'email', 'first_name', 'last_name', 'role', 'account_type', 'approval_status']
 
 
 class PasswordResetRequestSerializer(serializers.Serializer):
@@ -65,6 +66,10 @@ class DashboardChildSerializer(serializers.ModelSerializer):
             'first_name',
             'other_name',
             'last_name',
+            'email',
+            'phone_number',
+            'learner_type',
+            'programme_of_interest',
             'approval_status',
             'courses',
             'attendance_summary',
@@ -176,6 +181,7 @@ class InstructorStudentSerializer(serializers.ModelSerializer):
             'id',
             'full_name',
             'school_name',
+            'learner_type',
             'parent_name',
             'parent_phone',
             'assigned_course',
@@ -231,19 +237,76 @@ class InstructorEnrollmentSerializer(serializers.ModelSerializer):
 class RecentRegistrationSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ['id', 'email', 'first_name', 'last_name', 'role', 'date_joined']
+        fields = ['id', 'email', 'first_name', 'last_name', 'role', 'account_type', 'approval_status', 'date_joined']
+
+
+class PendingAccountSerializer(serializers.ModelSerializer):
+    full_name = serializers.SerializerMethodField()
+    phone_number = serializers.SerializerMethodField()
+    programme_of_interest = serializers.SerializerMethodField()
+    learner_type = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            'id',
+            'full_name',
+            'email',
+            'role',
+            'account_type',
+            'approval_status',
+            'phone_number',
+            'programme_of_interest',
+            'learner_type',
+            'date_joined',
+        ]
+
+    def get_full_name(self, obj):
+        return f'{obj.first_name} {obj.last_name}'.strip() or obj.email
+
+    def get_phone_number(self, obj):
+        parent = getattr(obj, 'parent_profile', None)
+        if parent:
+            return parent.phone_number
+        student = getattr(obj, 'student_profile', None)
+        return student.phone_number if student else ''
+
+    def get_programme_of_interest(self, obj):
+        student = getattr(obj, 'student_profile', None)
+        return student.programme_of_interest if student else ''
+
+    def get_learner_type(self, obj):
+        student = getattr(obj, 'student_profile', None)
+        if student:
+            return student.learner_type
+        return 'parent'
 
 
 class RegisterSerializer(serializers.Serializer):
+    full_name = serializers.CharField(max_length=220, write_only=True, required=False, allow_blank=True)
     first_name = serializers.CharField(max_length=100)
     last_name = serializers.CharField(max_length=100)
     email = serializers.EmailField()
     phone_number = serializers.CharField(max_length=20, write_only=True)
+    programme_of_interest = serializers.ChoiceField(
+        choices=[choice[0] for choice in Student.PROGRAMME_CHOICES],
+        write_only=True,
+        required=False,
+        allow_blank=True,
+    )
     password = serializers.CharField(write_only=True)
     confirm_password = serializers.CharField(write_only=True)
+    account_type = serializers.ChoiceField(
+        choices=[
+            User.ACCOUNT_PARENT_REGISTERING_CHILD,
+            User.ACCOUNT_ADULT_LEARNER,
+        ],
+        default=User.ACCOUNT_PARENT_REGISTERING_CHILD,
+    )
     role = serializers.ChoiceField(
         choices=[User.ROLE_PARENT, User.ROLE_STUDENT],
         default=User.ROLE_PARENT,
+        required=False,
     )
 
     def validate_email(self, value):
@@ -255,11 +318,27 @@ class RegisterSerializer(serializers.Serializer):
         if attrs['password'] != attrs['confirm_password']:
             raise serializers.ValidationError({'confirm_password': 'Passwords do not match.'})
         validate_password(attrs['password'])
+        account_type = attrs.get('account_type')
+        if account_type == User.ACCOUNT_ADULT_LEARNER:
+            attrs['role'] = User.ROLE_STUDENT
+            if not attrs.get('programme_of_interest'):
+                raise serializers.ValidationError({
+                    'programme_of_interest': 'Programme of interest is required for adult learners.',
+                })
+            full_name = attrs.get('full_name', '').strip()
+            if full_name:
+                parts = full_name.split()
+                attrs['first_name'] = parts[0]
+                attrs['last_name'] = ' '.join(parts[1:]) or parts[0]
+        else:
+            attrs['role'] = User.ROLE_PARENT
         return attrs
 
     def create(self, validated_data):
         validated_data.pop('confirm_password')
+        validated_data.pop('full_name', None)
         phone_number = validated_data.pop('phone_number')
+        programme_of_interest = validated_data.pop('programme_of_interest', '')
         user = User.objects.create_user(**validated_data)
 
         if user.role == User.ROLE_PARENT:
@@ -277,6 +356,8 @@ class RegisterSerializer(serializers.Serializer):
                 last_name=user.last_name,
                 email=user.email,
                 phone_number=phone_number,
+                learner_type=Student.LEARNER_ADULT,
+                programme_of_interest=programme_of_interest,
             )
         return user
 
@@ -302,11 +383,50 @@ class ChangePasswordSerializer(serializers.Serializer):
 class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
     username_field = 'email'
 
+    def validate(self, attrs):
+        if attrs.get('approval_status') == User.APPROVAL_PENDING:
+            raise AuthenticationFailed(
+                'Your account is pending admin approval. You will be notified once approved.'
+            )
+        if attrs.get('approval_status') == User.APPROVAL_REJECTED:
+            raise AuthenticationFailed(
+                'Your account was not approved. Please contact Velttech Coding Academy.'
+            )
+        data = super().validate(attrs)
+        if self.user.approval_status == User.APPROVAL_PENDING:
+            raise AuthenticationFailed(
+                'Your account is pending admin approval. You will be notified once approved.'
+            )
+        if self.user.approval_status == User.APPROVAL_REJECTED:
+            raise AuthenticationFailed(
+                'Your account was not approved. Please contact Velttech Coding Academy.'
+            )
+        student = getattr(self.user, 'student_profile', None)
+        if (
+            self.user.role == User.ROLE_STUDENT
+            and student
+            and student.approval_status == Student.STATUS_PENDING
+        ):
+            raise AuthenticationFailed(
+                'Your account is pending admin approval. You will be notified once approved.'
+            )
+        if (
+            self.user.role == User.ROLE_STUDENT
+            and student
+            and student.approval_status == Student.STATUS_REJECTED
+        ):
+            raise AuthenticationFailed(
+                'Your account was not approved. Please contact Velttech Coding Academy.'
+            )
+        return data
+
     @classmethod
     def get_token(cls, user):
         token = super().get_token(user)
         token['email'] = user.email
         token['role'] = user.role
+        token['account_type'] = user.account_type
+        token['approval_status'] = user.approval_status
         token['first_name'] = user.first_name
         token['last_name'] = user.last_name
         return token

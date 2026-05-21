@@ -53,6 +53,7 @@ from .serializers import (
     ChangePasswordSerializer,
     PasswordResetConfirmSerializer,
     PasswordResetRequestSerializer,
+    PendingAccountSerializer,
     UserSerializer,
 )
 from enrollments.serializers import (
@@ -91,6 +92,15 @@ class IsInstructorUserRole(permissions.BasePermission):
 class RegisterView(generics.CreateAPIView):
     permission_classes = [permissions.AllowAny]
     serializer_class = RegisterSerializer
+
+    def perform_create(self, serializer):
+        user = serializer.save()
+        student = getattr(user, 'student_profile', None)
+        if user.role == User.ROLE_STUDENT and student and is_adult_learner(student):
+            try:
+                send_adult_signup_pending_email(student)
+            except Exception:
+                logger.exception('Could not send pending approval email for adult learner %s.', student.pk)
 
 
 class LoginView(TokenObtainPairView):
@@ -137,8 +147,21 @@ class PasswordResetRequestView(generics.GenericAPIView):
         if user:
             uid = urlsafe_base64_encode(force_bytes(user.pk))
             token = default_token_generator.make_token(user)
-            reset_link = f'http://localhost:3000/reset-password?uid={uid}&token={token}'
-            print(f'Password reset link for {user.email}: {reset_link}')
+            reset_link = f'{settings.FRONTEND_URL.rstrip("/")}/reset-password?uid={uid}&token={token}'
+            try:
+                send_mail(
+                    subject='Reset your Velttech Academy password',
+                    message=(
+                        'We received a request to reset your Velttech Academy password.\n\n'
+                        f'Reset link: {reset_link}\n\n'
+                        'If you did not request this, you can ignore this email.'
+                    ),
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=[user.email],
+                    fail_silently=False,
+                )
+            except Exception:
+                logger.exception('Could not send password reset email for user %s.', user.pk)
         return Response({'detail': 'If this email exists, a password reset link has been sent.'})
 
 
@@ -226,32 +249,125 @@ def approval_invoice_for_student(student):
         return create_pending_invoice_for_enrollment(enrollment)
 
 
+def ensure_adult_programme_enrollment(student):
+    if not is_adult_learner(student) or not student.programme_of_interest:
+        return None, False
+    course = Course.objects.filter(
+        title__iexact=student.programme_of_interest,
+        is_active=True,
+    ).first() or Course.objects.filter(title__iexact=student.programme_of_interest).first()
+    if not course:
+        return None, False
+    enrollment, created = Enrollment.objects.get_or_create(
+        student=student,
+        course=course,
+        defaults={'status': Enrollment.STATUS_PENDING},
+    )
+    return enrollment, created
+
+
 def format_invoice_amount(payment):
     return f'GHS {payment.amount:,.2f}' if payment else 'GHS 0.00'
 
 
+def is_adult_learner(student):
+    return student.learner_type == Student.LEARNER_ADULT or (student.user_id and not student.parent_id)
+
+
+def student_contact_email(student):
+    if is_adult_learner(student):
+        return student.email or (student.user.email if student.user else '')
+    if student.parent and student.parent.email:
+        return student.parent.email
+    if student.parent and student.parent.user:
+        return student.parent.user.email
+    return student.email or (student.user.email if student.user else '')
+
+
+def send_adult_signup_pending_email(student):
+    email = student_contact_email(student)
+    if not email:
+        return False
+    programme = student.programme_of_interest or 'To be confirmed'
+    send_mail(
+        subject='Your Velttech Academy Signup Is Pending Approval',
+        message=(
+            f'Dear {student},\n\n'
+            'We have received your Velttech Academy signup.\n\n'
+            f'Programme of interest: {programme}\n'
+            'Status: Pending admin approval\n\n'
+            'You will be notified once your account has been approved. '
+            'You will be able to access your student dashboard after approval.\n\n'
+            'Contact:\n'
+            'Email: info@velttech.org\n'
+            'Phone: +233 55 510 6820\n\n'
+            'Velttech Coding Academy\n'
+            'Website: https://velttech.org\n'
+        ),
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        recipient_list=[email],
+        fail_silently=False,
+    )
+    return True
+
+
+def send_parent_account_approval_email(user):
+    send_mail(
+        subject='Welcome to Velttech Coding Academy',
+        message=(
+            f'Dear {user.first_name},\n\n'
+            'Welcome to Velttech Coding Academy.\n\n'
+            'Your parent account has been approved. You can now log in to your parent portal, '
+            'add or manage child records, and follow academy updates.\n\n'
+            'Login link: https://velttech.org/login\n\n'
+            'Contact:\n'
+            'Email: info@velttech.org\n'
+            'Phone: +233 55 510 6820\n\n'
+            'Velttech Coding Academy\n'
+        ),
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        recipient_list=[user.email],
+        fail_silently=False,
+    )
+    return True
+
+
+def send_account_approval_email(user):
+    student = getattr(user, 'student_profile', None)
+    if user.role == User.ROLE_STUDENT and student:
+        return send_student_approval_email(student)
+    return send_parent_account_approval_email(user)
+
+
 def send_student_approval_email(student, payment=None):
-    if not student.parent or not student.parent.email:
+    recipient_email = student_contact_email(student)
+    if not recipient_email:
         return False
 
-    parent_name = str(student.parent)
-    child_name = str(student)
+    adult = is_adult_learner(student)
+    recipient_name = str(student) if adult else str(student.parent)
+    learner_name = str(student)
     course_summary = payment.enrollment.course.title if payment else student_course_summary(student)
     course_fee = format_invoice_amount(payment) if payment else 'To be confirmed by the academy'
+    approval_line = (
+        'Your adult learner account has been approved for Velttech Coding Academy.'
+        if adult else f'Your child, {learner_name}, has been approved for Velttech Coding Academy.'
+    )
+    portal_label = 'student portal' if adult else 'parent portal'
     message = (
-        f'Dear {parent_name},\n\n'
-        f'Your child, {child_name}, has been approved for Velttech Coding Academy.\n\n'
+        f'Dear {recipient_name},\n\n'
+        f'{approval_line}\n\n'
         f'Approved course: {course_summary}\n\n'
         f'Course fee: {course_fee}\n'
         'Login link: https://velttech.org/login\n\n'
-        'Please log in to your parent portal to complete payment.\n'
+        f'Please log in to your {portal_label} to complete payment.\n'
     )
     if payment:
         message += (
             f'Invoice amount: {format_invoice_amount(payment)}\n'
             'Payment status: Pending\n'
-            'Click Pay Now in the parent dashboard to complete payment.\n'
-            'Parent portal: https://velttech.org/payments\n\n'
+            'Click Pay Now in your dashboard to complete payment.\n'
+            'Payment portal: https://velttech.org/payments\n\n'
         )
     message += (
         'Contact:\n'
@@ -261,10 +377,11 @@ def send_student_approval_email(student, payment=None):
         'Website: https://velttech.org\n'
     )
     send_mail(
-        subject='Your Child Has Been Approved - Velttech Coding Academy',
+        subject='Your Velttech Coding Academy Enrollment Has Been Approved'
+        if adult else 'Your Child Has Been Approved - Velttech Coding Academy',
         message=message,
         from_email=settings.DEFAULT_FROM_EMAIL,
-        recipient_list=[student.parent.email],
+        recipient_list=[recipient_email],
         fail_silently=False,
     )
     return True
@@ -276,9 +393,10 @@ def send_admin_invoice_notification(student, payment):
     parent = student.parent
     message = (
         'A student has been approved and an invoice has been created.\n\n'
+        f'Learner type: {"Adult learner" if is_adult_learner(student) else "Child learner"}\n'
         f'Parent: {parent or "Not provided"}\n'
         f'Parent email: {parent.email if parent else "Not provided"}\n'
-        f'Child: {student}\n'
+        f'Learner: {student}\n'
         f'Course: {payment.enrollment.course.title}\n'
         f'Amount: {format_invoice_amount(payment)}\n'
         f'Payment status: {payment.status.title()}\n'
@@ -307,6 +425,24 @@ def visible_notifications_for(user):
         is_active=True,
         audience__in=[Notification.AUDIENCE_ALL, audience_map.get(user.role)],
     ).filter(Q(recipient__isnull=True) | Q(recipient=user))
+
+
+def enforce_student_approved(user):
+    if user.approval_status == User.APPROVAL_PENDING:
+        raise PermissionDenied(
+            'Your account is pending admin approval. You will be notified once approved.'
+        )
+    if user.approval_status == User.APPROVAL_REJECTED:
+        raise PermissionDenied('Your account was not approved. Please contact Velttech Coding Academy.')
+    if user.role != User.ROLE_STUDENT:
+        return
+    student = getattr(user, 'student_profile', None)
+    if student and student.approval_status == Student.STATUS_PENDING:
+        raise PermissionDenied(
+            'Your account is pending admin approval. You will be notified once approved.'
+        )
+    if student and student.approval_status == Student.STATUS_REJECTED:
+        raise PermissionDenied('Your account was not approved. Please contact Velttech Coding Academy.')
 
 
 def visible_courses_for(user):
@@ -344,6 +480,7 @@ class DashboardView(APIView):
 
     def get(self, request):
         user = request.user
+        enforce_student_approved(user)
         notifications = visible_notifications_for(user)[:5]
 
         if user.role == User.ROLE_ADMIN:
@@ -367,6 +504,10 @@ class DashboardView(APIView):
                         'total_students': Student.objects.count(),
                         'approved_students': Student.objects.filter(approval_status=Student.STATUS_APPROVED).count(),
                         'pending_approvals': Student.objects.filter(approval_status=Student.STATUS_PENDING).count(),
+                        'pending_accounts': User.objects.filter(
+                            approval_status=User.APPROVAL_PENDING,
+                            role__in=[User.ROLE_PARENT, User.ROLE_STUDENT],
+                        ).count(),
                         'total_parents': Parent.objects.count(),
                         'total_courses': Course.objects.count(),
                         'total_enrollments': Enrollment.objects.count(),
@@ -380,6 +521,13 @@ class DashboardView(APIView):
                         Student.objects.filter(approval_status=Student.STATUS_PENDING)
                         .prefetch_related('enrollments__course')
                         .distinct()[:5],
+                        many=True,
+                    ).data,
+                    'pending_accounts': PendingAccountSerializer(
+                        User.objects.filter(
+                            approval_status=User.APPROVAL_PENDING,
+                            role__in=[User.ROLE_PARENT, User.ROLE_STUDENT],
+                        ).select_related('parent_profile', 'student_profile')[:5],
                         many=True,
                     ).data,
                     'approved_unassigned_children': DashboardChildSerializer(
@@ -481,9 +629,41 @@ class DashboardView(APIView):
             progress_reports = ProgressReport.objects.filter(
                 enrollment__student__user=user,
             ).select_related('enrollment__course')
+            payments = visible_payments_for(user)
+            payment_summary = payments.aggregate(
+                total=Count('id'),
+                completed=Count('id', filter=Q(status=Payment.STATUS_PAID)),
+                pending=Count('id', filter=Q(status=Payment.STATUS_PENDING)),
+                completed_amount=Sum(
+                    'amount',
+                    filter=Q(status=Payment.STATUS_PAID),
+                ),
+                outstanding_amount=Sum(
+                    'amount',
+                    filter=Q(status=Payment.STATUS_PENDING),
+                ),
+            )
+            pending_payment_ids = list(
+                payments.filter(status=Payment.STATUS_PENDING).values_list('id', flat=True)
+            )
+            assignments = Assignment.objects.filter(
+                is_active=True,
+                course__enrollments__student__user=user,
+            ).distinct()
+            student_profile = getattr(user, 'student_profile', None)
+            latest_enrollment = Enrollment.objects.filter(
+                student__user=user,
+            ).select_related('course').order_by('-created_at').first()
             return Response(
                 {
                     'role': user.role,
+                    'learner_type': Student.LEARNER_ADULT,
+                    'selected_programme': (
+                        student_profile.programme_of_interest
+                        if student_profile and student_profile.programme_of_interest
+                        else (latest_enrollment.course.title if latest_enrollment else '')
+                    ),
+                    'enrollment_status': latest_enrollment.status if latest_enrollment else 'pending',
                     'courses': DashboardCourseSerializer(
                         visible_courses_for(user),
                         many=True,
@@ -499,9 +679,36 @@ class DashboardView(APIView):
                         'late': attendance.filter(status=Attendance.STATUS_LATE).count(),
                         'excused': attendance.filter(status=Attendance.STATUS_EXCUSED).count(),
                     },
+                    'recent_attendance': DashboardAttendanceSerializer(
+                        attendance.order_by('-date', '-created_at')[:5],
+                        many=True,
+                    ).data,
                     'latest_progress_report': DashboardProgressReportSerializer(
                         progress_reports.first(),
                     ).data if progress_reports.exists() else None,
+                    'assignment_summary': {
+                        'total': assignments.count(),
+                        'submitted': AssignmentSubmission.objects.filter(
+                            assignment__in=assignments,
+                            student__user=user,
+                            status__in=[
+                                AssignmentSubmission.STATUS_SUBMITTED,
+                                AssignmentSubmission.STATUS_GRADED,
+                            ],
+                        ).count(),
+                    },
+                    'payment_summary': {
+                        'total': payment_summary['total'] or 0,
+                        'completed': payment_summary['completed'] or 0,
+                        'pending': payment_summary['pending'] or 0,
+                        'completed_amount': payment_summary['completed_amount'] or 0,
+                        'outstanding_amount': payment_summary['outstanding_amount'] or 0,
+                        'pending_payment_ids': pending_payment_ids,
+                    },
+                    'recent_payments': DashboardPaymentSerializer(
+                        payments.order_by('-created_at')[:5],
+                        many=True,
+                    ).data,
                 }
             )
 
@@ -547,6 +754,7 @@ class MyCoursesView(generics.ListAPIView):
     serializer_class = DashboardCourseSerializer
 
     def get_queryset(self):
+        enforce_student_approved(self.request.user)
         return visible_courses_for(self.request.user)
 
 
@@ -556,6 +764,7 @@ class MyChildrenView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         user = self.request.user
+        enforce_student_approved(user)
         if user.role == User.ROLE_ADMIN:
             return Student.objects.prefetch_related('enrollments__course')
         if user.role == User.ROLE_PARENT:
@@ -571,6 +780,7 @@ class MyChildrenView(generics.ListCreateAPIView):
 
     def perform_create(self, serializer):
         user = self.request.user
+        enforce_student_approved(user)
         if user.role != User.ROLE_PARENT:
             raise PermissionDenied('Only parents can create children.')
         parent_profile = getattr(user, 'parent_profile', None)
@@ -584,6 +794,7 @@ class MyPaymentsView(generics.ListAPIView):
     serializer_class = DashboardPaymentSerializer
 
     def get_queryset(self):
+        enforce_student_approved(self.request.user)
         return visible_payments_for(self.request.user)
 
 
@@ -701,12 +912,19 @@ class MyPaymentHistoryView(APIView):
 
     def get(self, request):
         user = request.user
+        enforce_student_approved(user)
         if user.role == User.ROLE_PARENT:
             enrollments = Enrollment.objects.select_related(
                 'student',
                 'student__parent',
                 'course',
             ).filter(student__parent__user=user)
+        elif user.role == User.ROLE_STUDENT:
+            enrollments = Enrollment.objects.select_related(
+                'student',
+                'student__parent',
+                'course',
+            ).filter(student__user=user)
         elif user.role == User.ROLE_ADMIN:
             enrollments = Enrollment.objects.select_related(
                 'student',
@@ -745,6 +963,93 @@ class AdminPendingStudentsView(generics.ListAPIView):
         ).prefetch_related('enrollments__course')
 
 
+class AdminPendingAccountsView(generics.ListAPIView):
+    permission_classes = [permissions.IsAuthenticated, IsAdminUserRole]
+    serializer_class = PendingAccountSerializer
+
+    def get_queryset(self):
+        return User.objects.filter(
+            approval_status=User.APPROVAL_PENDING,
+            role__in=[User.ROLE_PARENT, User.ROLE_STUDENT],
+        ).select_related('parent_profile', 'student_profile')
+
+
+class AdminApproveAccountView(APIView):
+    permission_classes = [permissions.IsAuthenticated, IsAdminUserRole]
+
+    def post(self, request, pk):
+        user = generics.get_object_or_404(
+            User.objects.select_related('parent_profile', 'student_profile'),
+            pk=pk,
+        )
+        user.approval_status = User.APPROVAL_APPROVED
+        user.save(update_fields=['approval_status'])
+        log_admin_action(request, 'account_approved', f'Approved account {user.email}.')
+
+        payment = None
+        invoice_created = False
+        enrollment_created = False
+        student = getattr(user, 'student_profile', None)
+        if user.role == User.ROLE_STUDENT and student:
+            student.approval_status = Student.STATUS_APPROVED
+            student.save(update_fields=['approval_status', 'updated_at'])
+            try:
+                enrollment, enrollment_created = ensure_adult_programme_enrollment(student)
+                if enrollment_created:
+                    log_admin_action(
+                        request,
+                        'enrollment_created',
+                        f'Created enrollment for {student} in {enrollment.course}.',
+                    )
+            except Exception:
+                logger.exception('Could not create adult learner enrollment for student %s.', student.pk)
+                log_admin_action(request, 'enrollment_creation_failed', f'Could not create enrollment for {student}.')
+            try:
+                payment, invoice_created = approval_invoice_for_student(student)
+                if payment and invoice_created:
+                    log_admin_action(
+                        request,
+                        'invoice_created',
+                        f'Invoice created for {student} in {payment.enrollment.course}: {payment.receipt_number}.',
+                    )
+            except Exception:
+                logger.exception('Could not create approval invoice for student %s.', student.pk)
+                log_admin_action(request, 'invoice_creation_failed', f'Could not create invoice for {student}.')
+
+        email_sent = False
+        try:
+            email_sent = send_student_approval_email(student, payment) if student else send_parent_account_approval_email(user)
+            if email_sent:
+                log_admin_action(request, 'approval_email_sent', f'Approval email sent for account {user.email}.')
+        except Exception:
+            logger.exception('Could not send account approval email for user %s.', user.pk)
+            log_admin_action(request, 'approval_email_failed', f'Could not send approval email for account {user.email}.')
+
+        return Response({
+            'message': 'Account approved successfully.',
+            'enrollment_created': enrollment_created,
+            'invoice_created': invoice_created,
+            'payment_id': payment.id if payment else None,
+            'email_sent': email_sent,
+            'account': PendingAccountSerializer(user).data,
+        })
+
+
+class AdminRejectAccountView(APIView):
+    permission_classes = [permissions.IsAuthenticated, IsAdminUserRole]
+
+    def post(self, request, pk):
+        user = generics.get_object_or_404(User, pk=pk)
+        user.approval_status = User.APPROVAL_REJECTED
+        user.save(update_fields=['approval_status'])
+        student = getattr(user, 'student_profile', None)
+        if student:
+            student.approval_status = Student.STATUS_REJECTED
+            student.save(update_fields=['approval_status', 'updated_at'])
+        log_admin_action(request, 'account_rejected', f'Rejected account {user.email}.')
+        return Response({'message': 'Account rejected successfully.'})
+
+
 class AdminApproveStudentView(APIView):
     permission_classes = [permissions.IsAuthenticated, IsAdminUserRole]
 
@@ -756,7 +1061,23 @@ class AdminApproveStudentView(APIView):
         was_already_approved = student.approval_status == Student.STATUS_APPROVED
         student.approval_status = Student.STATUS_APPROVED
         student.save(update_fields=['approval_status', 'updated_at'])
+        if student.user:
+            student.user.approval_status = User.APPROVAL_APPROVED
+            student.user.save(update_fields=['approval_status'])
         log_admin_action(request, 'student_approved', f'Student approved: {student}.')
+
+        enrollment_created = False
+        try:
+            enrollment, enrollment_created = ensure_adult_programme_enrollment(student)
+            if enrollment_created:
+                log_admin_action(
+                    request,
+                    'enrollment_created',
+                    f'Created enrollment for {student} in {enrollment.course}.',
+                )
+        except Exception:
+            logger.exception('Could not create adult learner enrollment for student %s.', student.pk)
+            log_admin_action(request, 'enrollment_creation_failed', f'Could not create enrollment for {student}.')
 
         payment = None
         invoice_created = False
@@ -798,9 +1119,20 @@ class AdminApproveStudentView(APIView):
                 audience=Notification.AUDIENCE_PARENTS,
                 recipient=student.parent.user,
             )
+        elif student.user and (not was_already_approved or invoice_created):
+            Notification.objects.create(
+                title='Enrollment approved',
+                message=(
+                    'Your Velttech Coding Academy enrollment has been approved.'
+                    + (' A pending invoice is ready in your payment portal.' if payment else '')
+                ),
+                audience=Notification.AUDIENCE_STUDENTS,
+                recipient=student.user,
+            )
         return Response(
             {
                 'message': 'Student approved successfully.',
+                'enrollment_created': enrollment_created,
                 'invoice_created': invoice_created,
                 'payment_id': payment.id if payment else None,
                 'email_sent': email_sent,
@@ -816,6 +1148,9 @@ class AdminRejectStudentView(APIView):
         student = generics.get_object_or_404(Student, pk=pk)
         student.approval_status = Student.STATUS_REJECTED
         student.save(update_fields=['approval_status', 'updated_at'])
+        if student.user:
+            student.user.approval_status = User.APPROVAL_REJECTED
+            student.user.save(update_fields=['approval_status'])
         if student.parent and student.parent.user:
             Notification.objects.create(
                 title='Child not approved',
@@ -1061,6 +1396,7 @@ class MyAttendanceView(generics.ListAPIView):
     serializer_class = AttendanceSerializer
 
     def get_queryset(self):
+        enforce_student_approved(self.request.user)
         queryset = Attendance.objects.select_related(
             'enrollment',
             'enrollment__student',
@@ -1081,6 +1417,7 @@ class MyProgressView(generics.ListAPIView):
     serializer_class = ProgressReportSerializer
 
     def get_queryset(self):
+        enforce_student_approved(self.request.user)
         queryset = ProgressReport.objects.select_related(
             'enrollment',
             'enrollment__student',
@@ -1102,6 +1439,7 @@ class MyAssignmentsView(generics.ListAPIView):
 
     def get_queryset(self):
         user = self.request.user
+        enforce_student_approved(user)
         queryset = Assignment.objects.select_related('course', 'instructor').filter(
             is_active=True,
         )
@@ -1140,6 +1478,7 @@ class SubmitAssignmentView(APIView):
 
     def post(self, request, pk):
         user = request.user
+        enforce_student_approved(user)
         if user.role != User.ROLE_STUDENT:
             raise PermissionDenied('Only students can submit assignments.')
 

@@ -46,7 +46,7 @@ class EnrollmentSerializer(serializers.ModelSerializer):
 
     def validate_student(self, value):
         if value.approval_status != value.STATUS_APPROVED:
-            raise serializers.ValidationError('Only approved children can be enrolled.')
+            raise serializers.ValidationError('Only approved learners can be enrolled.')
         return value
 
 

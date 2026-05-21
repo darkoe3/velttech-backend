@@ -30,10 +30,13 @@ from payments.views import (
 )
 from students.views import ParentViewSet, StudentViewSet
 from users.views import (
+    AdminApproveAccountView,
     AdminApproveStudentView,
     AdminEnrollmentCreateView,
     AdminPaymentHistoryView,
+    AdminPendingAccountsView,
     AdminPendingStudentsView,
+    AdminRejectAccountView,
     AdminRejectStudentView,
     DashboardView,
     ChangePasswordView,
@@ -123,6 +126,9 @@ urlpatterns = [
     path('api/my-progress/', MyProgressView.as_view(), name='my_progress'),
     path('api/my-assignments/', MyAssignmentsView.as_view(), name='my_assignments'),
     path('api/my-assignments/<int:pk>/submit/', SubmitAssignmentView.as_view(), name='submit_assignment'),
+    path('api/admin/pending-accounts/', AdminPendingAccountsView.as_view(), name='admin-pending-accounts'),
+    path('api/admin/accounts/<int:pk>/approve/', AdminApproveAccountView.as_view(), name='admin-approve-account'),
+    path('api/admin/accounts/<int:pk>/reject/', AdminRejectAccountView.as_view(), name='admin-reject-account'),
     path('api/admin/pending-students/', AdminPendingStudentsView.as_view(), name='admin-pending-students'),
     path('api/admin/students/<int:pk>/approve/', AdminApproveStudentView.as_view(), name='admin-approve-student'),
     path('api/admin/students/<int:pk>/reject/', AdminRejectStudentView.as_view(), name='admin-reject-student'),

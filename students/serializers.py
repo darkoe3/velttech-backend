@@ -41,6 +41,8 @@ class StudentSerializer(serializers.ModelSerializer):
             'date_of_birth',
             'school_name',
             'emergency_contact',
+            'learner_type',
+            'programme_of_interest',
             'approval_status',
             'course_names',
             'created_at',
@@ -70,11 +72,13 @@ class MyChildSerializer(serializers.ModelSerializer):
             'school_name',
             'phone_number',
             'emergency_contact',
+            'learner_type',
+            'programme_of_interest',
             'approval_status',
             'created_at',
             'updated_at',
         ]
-        read_only_fields = ['approval_status', 'created_at', 'updated_at']
+        read_only_fields = ['learner_type', 'approval_status', 'created_at', 'updated_at']
 
     def get_full_name(self, obj):
         return str(obj)
