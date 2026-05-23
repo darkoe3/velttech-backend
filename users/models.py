@@ -71,6 +71,8 @@ class User(AbstractBaseUser, PermissionsMixin):
         choices=APPROVAL_STATUS_CHOICES,
         default=APPROVAL_PENDING,
     )
+    is_suspicious = models.BooleanField(default=False)
+    suspicious_reason = models.TextField(blank=True)
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
     date_joined = models.DateTimeField(auto_now_add=True)

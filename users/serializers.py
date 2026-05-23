@@ -1,8 +1,11 @@
+import re
+
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 from rest_framework.exceptions import AuthenticationFailed
-from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer, TokenRefreshSerializer
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from students.models import Parent, Student
 from courses.models import Course
@@ -13,11 +16,77 @@ from .models import ActivityLog
 
 User = get_user_model()
 
+GENERIC_SIGNUP_ERROR = 'Unable to create account. Please review your details and try again.'
+PENDING_APPROVAL_MESSAGE = 'Your account is pending admin approval. You will be notified once approved.'
+
+
+def normalize_phone_number(value):
+    cleaned = re.sub(r'[\s\-()]+', '', value or '')
+    digits = cleaned[1:] if cleaned.startswith('+') else cleaned
+    if not digits.isdigit() or len(digits) < 8 or len(digits) > 15:
+        raise serializers.ValidationError('Enter a valid international phone number.')
+    if len(set(digits)) == 1:
+        raise serializers.ValidationError('Enter a valid phone number.')
+    if digits in {'12345678', '123456789', '1234567890', '12345678901', '123456789012'}:
+        raise serializers.ValidationError('Enter a valid phone number.')
+    return f'+{digits}' if cleaned.startswith('+') else digits
+
+
+def is_random_looking_token(token):
+    compact = re.sub(r"[^A-Za-z]", "", token or "")
+    if len(compact) < 12:
+        return False
+    upper = sum(1 for char in compact if char.isupper())
+    lower = sum(1 for char in compact if char.islower())
+    vowels = sum(1 for char in compact.lower() if char in 'aeiou')
+    has_mixed_case = upper >= 2 and lower >= 2
+    vowel_ratio = vowels / len(compact)
+    return has_mixed_case or vowel_ratio < 0.18
+
+
+def validate_human_name(value, field_label):
+    name = (value or '').strip()
+    if len(name) < 2:
+        raise serializers.ValidationError(f'{field_label} is too short.')
+    if len(name) > 60:
+        raise serializers.ValidationError(f'{field_label} is too long.')
+    letters = [char for char in name if char.isalpha()]
+    if not letters or len(letters) / max(len(name), 1) < 0.7:
+        raise serializers.ValidationError(f'{field_label} should contain mostly alphabetic characters.')
+    allowed_marks = set(" '-.")
+    if any(not (char.isalpha() or char in allowed_marks) for char in name):
+        raise serializers.ValidationError(f'{field_label} contains unsupported characters.')
+    tokens = [token for token in re.split(r"[\s'.-]+", name) if token]
+    if any(len(token) > 24 or is_random_looking_token(token) for token in tokens):
+        raise serializers.ValidationError(f'Enter a real {field_label.lower()}.')
+    return name
+
+
+def email_suspicion_reasons(email):
+    local_part = (email or '').split('@', 1)[0]
+    compact = re.sub(r'[^A-Za-z0-9]', '', local_part)
+    reasons = []
+    if len(compact) >= 18 and is_random_looking_token(compact):
+        reasons.append('random-looking email name')
+    if re.search(r'(.)\1{5,}', compact):
+        reasons.append('repeated characters in email')
+    return reasons
+
 
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ['id', 'email', 'first_name', 'last_name', 'role', 'account_type', 'approval_status']
+        fields = [
+            'id',
+            'email',
+            'first_name',
+            'last_name',
+            'role',
+            'account_type',
+            'approval_status',
+            'is_suspicious',
+            'suspicious_reason',
+        ]
 
 
 class PasswordResetRequestSerializer(serializers.Serializer):
@@ -57,6 +126,8 @@ class DashboardChildSerializer(serializers.ModelSerializer):
     courses = serializers.SerializerMethodField()
     attendance_summary = serializers.SerializerMethodField()
     latest_progress_report = serializers.SerializerMethodField()
+    is_suspicious = serializers.SerializerMethodField()
+    suspicious_reason = serializers.SerializerMethodField()
 
     class Meta:
         model = Student
@@ -71,6 +142,8 @@ class DashboardChildSerializer(serializers.ModelSerializer):
             'learner_type',
             'programme_of_interest',
             'approval_status',
+            'is_suspicious',
+            'suspicious_reason',
             'courses',
             'attendance_summary',
             'latest_progress_report',
@@ -98,6 +171,12 @@ class DashboardChildSerializer(serializers.ModelSerializer):
             enrollment__student=obj,
         ).select_related('enrollment__course').first()
         return DashboardProgressReportSerializer(report).data if report else None
+
+    def get_is_suspicious(self, obj):
+        return bool(obj.user and obj.user.is_suspicious)
+
+    def get_suspicious_reason(self, obj):
+        return obj.user.suspicious_reason if obj.user else ''
 
 
 class DashboardPaymentSerializer(serializers.ModelSerializer):
@@ -237,7 +316,18 @@ class InstructorEnrollmentSerializer(serializers.ModelSerializer):
 class RecentRegistrationSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ['id', 'email', 'first_name', 'last_name', 'role', 'account_type', 'approval_status', 'date_joined']
+        fields = [
+            'id',
+            'email',
+            'first_name',
+            'last_name',
+            'role',
+            'account_type',
+            'approval_status',
+            'is_suspicious',
+            'suspicious_reason',
+            'date_joined',
+        ]
 
 
 class PendingAccountSerializer(serializers.ModelSerializer):
@@ -258,6 +348,8 @@ class PendingAccountSerializer(serializers.ModelSerializer):
             'phone_number',
             'programme_of_interest',
             'learner_type',
+            'is_suspicious',
+            'suspicious_reason',
             'date_joined',
         ]
 
@@ -288,8 +380,10 @@ class RegisterSerializer(serializers.Serializer):
     last_name = serializers.CharField(max_length=100)
     email = serializers.EmailField()
     phone_number = serializers.CharField(max_length=20, write_only=True)
-    programme_of_interest = serializers.ChoiceField(
-        choices=[choice[0] for choice in Student.PROGRAMME_CHOICES],
+    website = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    company = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    programme_of_interest = serializers.CharField(
+        max_length=150,
         write_only=True,
         required=False,
         allow_blank=True,
@@ -312,19 +406,31 @@ class RegisterSerializer(serializers.Serializer):
     def validate_email(self, value):
         if User.objects.filter(email__iexact=value).exists():
             raise serializers.ValidationError('A user with this email already exists.')
-        return value
+        return value.lower()
+
+    def validate_phone_number(self, value):
+        return normalize_phone_number(value)
 
     def validate(self, attrs):
+        if attrs.get('website') or attrs.get('company'):
+            raise serializers.ValidationError({'detail': GENERIC_SIGNUP_ERROR})
         if attrs['password'] != attrs['confirm_password']:
             raise serializers.ValidationError({'confirm_password': 'Passwords do not match.'})
         validate_password(attrs['password'])
         account_type = attrs.get('account_type')
         if account_type == User.ACCOUNT_ADULT_LEARNER:
             attrs['role'] = User.ROLE_STUDENT
-            if not attrs.get('programme_of_interest'):
+            programme = (attrs.get('programme_of_interest') or '').strip()
+            valid_programmes = {choice[0] for choice in Student.PROGRAMME_CHOICES}
+            if not programme:
                 raise serializers.ValidationError({
                     'programme_of_interest': 'Programme of interest is required for adult learners.',
                 })
+            if programme not in valid_programmes:
+                raise serializers.ValidationError({
+                    'programme_of_interest': 'Select a valid programme.',
+                })
+            attrs['programme_of_interest'] = programme
             full_name = attrs.get('full_name', '').strip()
             if full_name:
                 parts = full_name.split()
@@ -332,11 +438,24 @@ class RegisterSerializer(serializers.Serializer):
                 attrs['last_name'] = ' '.join(parts[1:]) or parts[0]
         else:
             attrs['role'] = User.ROLE_PARENT
+            programme = (attrs.get('programme_of_interest') or '').strip()
+            attrs['programme_of_interest'] = '' if programme.lower() == 'not selected' else programme
+
+        attrs['first_name'] = validate_human_name(attrs.get('first_name'), 'First name')
+        attrs['last_name'] = validate_human_name(attrs.get('last_name'), 'Last name')
+
+        suspicious_reasons = list(self.context.get('suspicious_reasons', []))
+        suspicious_reasons.extend(email_suspicion_reasons(attrs.get('email')))
+        attrs['is_suspicious'] = bool(suspicious_reasons)
+        attrs['suspicious_reason'] = '; '.join(dict.fromkeys(suspicious_reasons))
+        attrs['approval_status'] = User.APPROVAL_PENDING
         return attrs
 
     def create(self, validated_data):
         validated_data.pop('confirm_password')
         validated_data.pop('full_name', None)
+        validated_data.pop('website', None)
+        validated_data.pop('company', None)
         phone_number = validated_data.pop('phone_number')
         programme_of_interest = validated_data.pop('programme_of_interest', '')
         user = User.objects.create_user(**validated_data)
@@ -386,7 +505,7 @@ class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
     def validate(self, attrs):
         if attrs.get('approval_status') == User.APPROVAL_PENDING:
             raise AuthenticationFailed(
-                'Your account is pending admin approval. You will be notified once approved.'
+                PENDING_APPROVAL_MESSAGE
             )
         if attrs.get('approval_status') == User.APPROVAL_REJECTED:
             raise AuthenticationFailed(
@@ -395,7 +514,7 @@ class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
         data = super().validate(attrs)
         if self.user.approval_status == User.APPROVAL_PENDING:
             raise AuthenticationFailed(
-                'Your account is pending admin approval. You will be notified once approved.'
+                PENDING_APPROVAL_MESSAGE
             )
         if self.user.approval_status == User.APPROVAL_REJECTED:
             raise AuthenticationFailed(
@@ -408,7 +527,7 @@ class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
             and student.approval_status == Student.STATUS_PENDING
         ):
             raise AuthenticationFailed(
-                'Your account is pending admin approval. You will be notified once approved.'
+                PENDING_APPROVAL_MESSAGE
             )
         if (
             self.user.role == User.ROLE_STUDENT
@@ -430,3 +549,24 @@ class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
         token['first_name'] = user.first_name
         token['last_name'] = user.last_name
         return token
+
+
+class ApprovalAwareTokenRefreshSerializer(TokenRefreshSerializer):
+    def validate(self, attrs):
+        refresh = RefreshToken(attrs['refresh'])
+        user_id = refresh.get('user_id')
+        user = User.objects.filter(pk=user_id).first()
+        if not user or user.approval_status == User.APPROVAL_PENDING:
+            raise AuthenticationFailed(PENDING_APPROVAL_MESSAGE)
+        if user.approval_status == User.APPROVAL_REJECTED:
+            raise AuthenticationFailed(
+                'Your account was not approved. Please contact Velttech Coding Academy.'
+            )
+        student = getattr(user, 'student_profile', None)
+        if user.role == User.ROLE_STUDENT and student and student.approval_status == Student.STATUS_PENDING:
+            raise AuthenticationFailed(PENDING_APPROVAL_MESSAGE)
+        if user.role == User.ROLE_STUDENT and student and student.approval_status == Student.STATUS_REJECTED:
+            raise AuthenticationFailed(
+                'Your account was not approved. Please contact Velttech Coding Academy.'
+            )
+        return super().validate(attrs)

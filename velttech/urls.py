@@ -18,7 +18,6 @@ from django.contrib import admin
 from django.urls import include, path
 from django.http import JsonResponse
 from rest_framework.routers import DefaultRouter
-from rest_framework_simplejwt.views import TokenRefreshView
 
 from courses.views import CourseViewSet
 from enrollments.views import EnrollmentViewSet
@@ -51,6 +50,7 @@ from users.views import (
     MyPaymentsView,
     MyPaymentHistoryView,
     RegisterView,
+    RefreshView,
     InstructorCoursesView,
     InstructorDashboardView,
     InstructorAttendanceView,
@@ -108,7 +108,7 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/auth/register/', RegisterView.as_view(), name='register'),
     path('api/auth/login/', LoginView.as_view(), name='token_obtain_pair'),
-    path('api/auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('api/auth/refresh/', RefreshView.as_view(), name='token_refresh'),
     path('api/auth/logout/', LogoutView.as_view(), name='token_blacklist'),
     path('api/auth/me/', MeView.as_view(), name='me'),
     path('api/auth/change-password/', ChangePasswordView.as_view(), name='change-password'),

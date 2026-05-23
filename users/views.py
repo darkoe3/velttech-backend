@@ -5,6 +5,7 @@ import logging
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.conf import settings
+from django.core.cache import cache
 from django.core.mail import send_mail
 from django.db import transaction
 from django.utils.encoding import force_str
@@ -13,12 +14,12 @@ from django.utils.encoding import force_bytes
 from django.db.models.functions import ExtractMonth
 from django.db.models import Count, Prefetch, Q, Sum
 from django.utils import timezone
-from rest_framework import generics, permissions
+from rest_framework import generics, permissions, status
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from courses.models import Course
 from enrollments.models import (
@@ -38,6 +39,7 @@ from students.serializers import MyChildSerializer
 from .models import ActivityLog
 from .serializers import (
     ActivityLogSerializer,
+    ApprovalAwareTokenRefreshSerializer,
     DashboardAttendanceSerializer,
     DashboardChildSerializer,
     DashboardCourseSerializer,
@@ -89,9 +91,56 @@ class IsInstructorUserRole(permissions.BasePermission):
         )
 
 
+def signup_rate_key(kind, value):
+    clean_value = ''.join(char if char.isalnum() else '_' for char in (value or '').lower())
+    return f'signup-rate:{kind}:{clean_value[:120]}'
+
+
+def bump_signup_attempt(key, timeout=600):
+    if not key:
+        return 0
+    if cache.add(key, 1, timeout=timeout):
+        return 1
+    try:
+        return cache.incr(key)
+    except ValueError:
+        cache.set(key, 1, timeout=timeout)
+        return 1
+
+
 class RegisterView(generics.CreateAPIView):
     permission_classes = [permissions.AllowAny]
     serializer_class = RegisterSerializer
+    max_signup_attempts = 3
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        repeated_attempts = getattr(self.request, '_request_signup_attempts', 1) > 1
+        context['suspicious_reasons'] = ['repeated signup attempts'] if repeated_attempts else []
+        return context
+
+    def create(self, request, *args, **kwargs):
+        email = (request.data.get('email') or '').strip().lower()
+        ip_address = client_ip(request) or 'unknown'
+        attempt_counts = [
+            bump_signup_attempt(signup_rate_key('ip', ip_address)),
+        ]
+        if email:
+            attempt_counts.append(bump_signup_attempt(signup_rate_key('email', email)))
+        request._request_signup_attempts = max(attempt_counts)
+
+        if request._request_signup_attempts > self.max_signup_attempts:
+            return Response(
+                {'detail': 'Too many signup attempts. Please try again later.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        response = super().create(request, *args, **kwargs)
+        response.data = {
+            'detail': 'Your account has been submitted successfully and is awaiting admin approval.',
+            'pending_approval': True,
+        }
+        return response
 
     def perform_create(self, serializer):
         user = serializer.save()
@@ -106,6 +155,11 @@ class RegisterView(generics.CreateAPIView):
 class LoginView(TokenObtainPairView):
     permission_classes = [permissions.AllowAny]
     serializer_class = EmailTokenObtainPairSerializer
+
+
+class RefreshView(TokenRefreshView):
+    permission_classes = [permissions.AllowAny]
+    serializer_class = ApprovalAwareTokenRefreshSerializer
 
 
 class LogoutView(generics.GenericAPIView):
@@ -960,7 +1014,7 @@ class AdminPendingStudentsView(generics.ListAPIView):
     def get_queryset(self):
         return Student.objects.filter(
             approval_status=Student.STATUS_PENDING,
-        ).prefetch_related('enrollments__course')
+        ).select_related('user').prefetch_related('enrollments__course')
 
 
 class AdminPendingAccountsView(generics.ListAPIView):
