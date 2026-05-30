@@ -653,10 +653,14 @@ class DashboardView(APIView):
             pending_payment_ids = list(
                 payments.filter(status=Payment.STATUS_PENDING).values_list('id', flat=True)
             )
+            payment_dashboard = build_parent_payment_dashboard(children, payments)
+            serialized_children = DashboardChildSerializer(children, many=True).data
+            for child in serialized_children:
+                child.update(payment_dashboard['child_statuses'].get(child['id'], {}))
             return Response(
                 {
                     'role': user.role,
-                    'children': DashboardChildSerializer(children, many=True).data,
+                    'children': serialized_children,
                     'payment_summary': {
                         'total': payment_summary['total'] or 0,
                         'completed': payment_summary['completed'] or 0,
@@ -664,6 +668,11 @@ class DashboardView(APIView):
                         'completed_amount': payment_summary['completed_amount'] or 0,
                         'outstanding_amount': payment_summary['outstanding_amount'] or 0,
                         'pending_payment_ids': pending_payment_ids,
+                        'current_payment_period': payment_dashboard['current_payment_period'],
+                        'current_pending_payment_ids': payment_dashboard['current_pending_payment_ids'],
+                        'outstanding_monthly_payment': payment_dashboard['outstanding_monthly_payment'],
+                        'current_amount_paid': payment_dashboard['current_amount_paid'],
+                        'last_payment': payment_dashboard['last_payment'],
                     },
                     'recent_payments': DashboardPaymentSerializer(
                         payments.order_by('-created_at')[:5],
@@ -863,6 +872,87 @@ def month_sequence(start_date, end_date):
             current = current.replace(month=current.month + 1)
 
 
+PAYMENT_PERIOD_MONTHS = [
+    '',
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December',
+]
+
+
+def payment_period_label(payment, year, month):
+    if payment and payment.payment_period:
+        return payment.payment_period
+    if month and year and 1 <= month <= 12:
+        return f'{PAYMENT_PERIOD_MONTHS[month]} {year}'
+    return str(year) if year else ''
+
+
+def payment_period_for_payment(payment):
+    payment_day = payment.payment_date or (
+        payment.paid_at.date() if payment.paid_at else payment.created_at.date()
+    )
+    return payment_period_label(
+        payment,
+        payment.year or payment_day.year,
+        payment.month or payment_day.month,
+    )
+
+
+def build_parent_payment_dashboard(children, payments):
+    today = timezone.localdate()
+    current_period = payment_period_label(None, today.year, today.month)
+    current_payments = payments.filter(
+        Q(month=today.month, year=today.year)
+        | Q(payment_date__year=today.year, payment_date__month=today.month)
+        | Q(paid_at__year=today.year, paid_at__month=today.month)
+        | Q(month__isnull=True, year__isnull=True, created_at__year=today.year, created_at__month=today.month)
+    )
+    current_pending = current_payments.filter(status=Payment.STATUS_PENDING)
+    current_paid = current_payments.filter(status=Payment.STATUS_PAID)
+    latest_payment = payments.filter(status=Payment.STATUS_PAID).order_by('-paid_at', '-payment_date', '-created_at').first()
+
+    child_statuses = {}
+    for child in children:
+        child_current = current_payments.filter(enrollment__student_id=child.id)
+        child_pending = child_current.filter(status=Payment.STATUS_PENDING)
+        child_paid = child_current.filter(status=Payment.STATUS_PAID)
+        child_statuses[child.id] = {
+            'current_payment_status': (
+                'pending'
+                if child_pending.exists()
+                else ('paid' if child_paid.exists() else 'no outstanding payment')
+            ),
+            'current_payment_period': current_period,
+            'outstanding_amount': child_pending.aggregate(total=Sum('amount'))['total'] or Decimal('0.00'),
+            'pending_payment_ids': list(child_pending.values_list('id', flat=True)),
+        }
+
+    return {
+        'current_payment_period': current_period,
+        'current_pending_payment_ids': list(current_pending.values_list('id', flat=True)),
+        'outstanding_monthly_payment': current_pending.aggregate(total=Sum('amount'))['total'] or Decimal('0.00'),
+        'current_amount_paid': current_paid.aggregate(total=Sum('amount'))['total'] or Decimal('0.00'),
+        'last_payment': {
+            'amount': latest_payment.amount,
+            'payment_period': payment_period_for_payment(latest_payment),
+            'paid_at': latest_payment.paid_at,
+            'student_name': str(latest_payment.enrollment.student),
+            'course_title': latest_payment.enrollment.course.title,
+        } if latest_payment else None,
+        'child_statuses': child_statuses,
+    }
+
+
 def build_payment_history_rows(enrollments):
     today = timezone.localdate()
     rows = []
@@ -926,6 +1016,7 @@ def build_payment_history_rows(enrollments):
                     'course_title': enrollment.course.title,
                     'month': period.month,
                     'year': period.year,
+                    'payment_period': payment_period_label(latest_payment, period.year, period.month),
                     'expected_amount': expected_amount,
                     'amount_paid': amount_paid,
                     'balance': balance,

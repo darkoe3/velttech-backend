@@ -15,7 +15,10 @@ class PaymentAdmin(admin.ModelAdmin):
         'receipt_number',
         'month',
         'year',
+        'payment_period',
         'payment_date',
+        'invoice_email_sent_at',
+        'confirmation_email_sent_at',
         'paid_at',
     )
     list_filter = ('payment_method', 'status', 'month', 'year')

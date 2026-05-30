@@ -5,7 +5,6 @@ from secrets import token_hex
 
 import requests
 from django.conf import settings
-from django.core.mail import send_mail
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -84,7 +83,6 @@ def paystack_charge_matches_payment(payment, paystack_data):
 
 
 def mark_payment_paid(payment):
-    was_paid = payment.status == Payment.STATUS_PAID
     payment.status = Payment.STATUS_PAID
     payment.payment_method = Payment.METHOD_PAYSTACK
     payment.paid_at = payment.paid_at or timezone.now()
@@ -97,43 +95,7 @@ def mark_payment_paid(payment):
         'receipt_number',
         'updated_at',
     ])
-    if not was_paid:
-        send_payment_receipt_email(payment)
     return payment
-
-
-def send_payment_receipt_email(payment):
-    email = payment_email(payment)
-    if not email:
-        return False
-    try:
-        send_mail(
-            subject='Your Velttech Academy Payment Receipt',
-            message=(
-                'Thank you for your payment to Velttech Coding Academy.\n\n'
-                f'Receipt number: {payment.receipt_number}\n'
-                f'Learner: {payment.enrollment.student}\n'
-                f'Course: {payment.enrollment.course.title}\n'
-                f'Amount: GHS {payment.amount:,.2f}\n'
-                f'Payment status: {payment.status.title()}\n'
-                f'Paid at: {payment.paid_at}\n\n'
-                'You can view and print your receipt from your dashboard.\n\n'
-                'Velttech Coding Academy\n'
-                'Email: info@velttech.org\n'
-                'Phone: +233 55 510 6820\n'
-            ),
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[email],
-            fail_silently=False,
-        )
-    except Exception:
-        import logging
-        logging.getLogger(__name__).exception(
-            'Could not send payment receipt email for payment %s.',
-            payment.pk,
-        )
-        return False
-    return True
 
 
 def mark_payment_failed(payment):

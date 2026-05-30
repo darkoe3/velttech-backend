@@ -5,6 +5,23 @@ from enrollments.serializers import EnrollmentSerializer
 from .models import Payment
 
 
+MONTH_NAMES = [
+    '',
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December',
+]
+
+
 def course_fee(course):
     fee = getattr(course, 'fee', None)
     if fee:
@@ -21,6 +38,7 @@ class PaymentSerializer(serializers.ModelSerializer):
     reference = serializers.CharField(source='transaction_reference', read_only=True)
     balance = serializers.SerializerMethodField()
     payment_status = serializers.SerializerMethodField()
+    payment_period_display = serializers.SerializerMethodField()
 
     class Meta:
         model = Payment
@@ -40,9 +58,13 @@ class PaymentSerializer(serializers.ModelSerializer):
             'reference',
             'month',
             'year',
+            'payment_period',
+            'payment_period_display',
             'payment_date',
             'balance',
             'receipt_number',
+            'invoice_email_sent_at',
+            'confirmation_email_sent_at',
             'notes',
             'paid_at',
             'created_at',
@@ -74,6 +96,15 @@ class PaymentSerializer(serializers.ModelSerializer):
             return 'partial'
         return 'unpaid'
 
+    def get_payment_period_display(self, obj):
+        if obj.payment_period:
+            return obj.payment_period
+        if obj.month and obj.year and 1 <= obj.month <= 12:
+            return f'{MONTH_NAMES[obj.month]} {obj.year}'
+        if obj.year:
+            return str(obj.year)
+        return ''
+
 
 class PaymentHistorySerializer(serializers.Serializer):
     id = serializers.IntegerField(allow_null=True)
@@ -84,6 +115,7 @@ class PaymentHistorySerializer(serializers.Serializer):
     course_title = serializers.CharField()
     month = serializers.IntegerField()
     year = serializers.IntegerField()
+    payment_period = serializers.CharField(allow_blank=True)
     expected_amount = serializers.DecimalField(max_digits=10, decimal_places=2)
     amount_paid = serializers.DecimalField(max_digits=10, decimal_places=2)
     balance = serializers.DecimalField(max_digits=10, decimal_places=2)
