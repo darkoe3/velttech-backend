@@ -22,13 +22,6 @@ MONTH_NAMES = [
 ]
 
 
-def course_fee(course):
-    fee = getattr(course, 'fee', None)
-    if fee:
-        return fee
-    return course.monthly_fee
-
-
 class PaymentSerializer(serializers.ModelSerializer):
     enrollment_detail = EnrollmentSerializer(source='enrollment', read_only=True)
     student_name = serializers.SerializerMethodField()
@@ -36,7 +29,6 @@ class PaymentSerializer(serializers.ModelSerializer):
     parent_email = serializers.SerializerMethodField()
     course_title = serializers.CharField(source='enrollment.course.title', read_only=True)
     reference = serializers.CharField(source='transaction_reference', read_only=True)
-    balance = serializers.SerializerMethodField()
     payment_status = serializers.SerializerMethodField()
     payment_period_display = serializers.SerializerMethodField()
 
@@ -61,7 +53,6 @@ class PaymentSerializer(serializers.ModelSerializer):
             'payment_period',
             'payment_period_display',
             'payment_date',
-            'balance',
             'receipt_number',
             'invoice_email_sent_at',
             'confirmation_email_sent_at',
@@ -82,19 +73,8 @@ class PaymentSerializer(serializers.ModelSerializer):
         parent = obj.enrollment.student.parent
         return parent.email if parent else ''
 
-    def get_balance(self, obj):
-        paid_amount = obj.amount if obj.status == Payment.STATUS_PAID else 0
-        return max(course_fee(obj.enrollment.course) - paid_amount, 0)
-
     def get_payment_status(self, obj):
-        if obj.status in [Payment.STATUS_PENDING, Payment.STATUS_FAILED]:
-            return obj.status
-        expected = course_fee(obj.enrollment.course)
-        if obj.amount >= expected:
-            return 'paid'
-        if obj.amount > 0:
-            return 'partial'
-        return 'unpaid'
+        return obj.status
 
     def get_payment_period_display(self, obj):
         if obj.payment_period:
@@ -116,9 +96,9 @@ class PaymentHistorySerializer(serializers.Serializer):
     month = serializers.IntegerField()
     year = serializers.IntegerField()
     payment_period = serializers.CharField(allow_blank=True)
-    expected_amount = serializers.DecimalField(max_digits=10, decimal_places=2)
+    amount = serializers.DecimalField(max_digits=10, decimal_places=2)
+    amount_due = serializers.DecimalField(max_digits=10, decimal_places=2)
     amount_paid = serializers.DecimalField(max_digits=10, decimal_places=2)
-    balance = serializers.DecimalField(max_digits=10, decimal_places=2)
     payment_status = serializers.CharField()
     payment_method = serializers.CharField(allow_blank=True)
     reference = serializers.CharField(allow_blank=True)

@@ -910,29 +910,24 @@ def payment_period_for_payment(payment):
 
 def build_parent_payment_dashboard(children, payments):
     today = timezone.localdate()
-    current_period = payment_period_label(None, today.year, today.month)
-    current_payments = payments.filter(
-        Q(month=today.month, year=today.year)
-        | Q(payment_date__year=today.year, payment_date__month=today.month)
-        | Q(paid_at__year=today.year, paid_at__month=today.month)
-        | Q(month__isnull=True, year__isnull=True, created_at__year=today.year, created_at__month=today.month)
-    )
-    current_pending = current_payments.filter(status=Payment.STATUS_PENDING)
-    current_paid = current_payments.filter(status=Payment.STATUS_PAID)
+    current_pending = payments.filter(status=Payment.STATUS_PENDING)
+    paid_payments = payments.filter(status=Payment.STATUS_PAID)
+    display_payment = current_pending.order_by('-created_at').first() or paid_payments.order_by('-paid_at', '-payment_date', '-created_at').first()
+    current_period = payment_period_for_payment(display_payment) if display_payment else payment_period_label(None, today.year, today.month)
     latest_payment = payments.filter(status=Payment.STATUS_PAID).order_by('-paid_at', '-payment_date', '-created_at').first()
 
     child_statuses = {}
     for child in children:
-        child_current = current_payments.filter(enrollment__student_id=child.id)
-        child_pending = child_current.filter(status=Payment.STATUS_PENDING)
-        child_paid = child_current.filter(status=Payment.STATUS_PAID)
+        child_pending = current_pending.filter(enrollment__student_id=child.id)
+        child_paid = paid_payments.filter(enrollment__student_id=child.id)
+        child_display_payment = child_pending.order_by('-created_at').first() or child_paid.order_by('-paid_at', '-payment_date', '-created_at').first()
         child_statuses[child.id] = {
             'current_payment_status': (
                 'pending'
                 if child_pending.exists()
                 else ('paid' if child_paid.exists() else 'no outstanding payment')
             ),
-            'current_payment_period': current_period,
+            'current_payment_period': payment_period_for_payment(child_display_payment) if child_display_payment else current_period,
             'outstanding_amount': child_pending.aggregate(total=Sum('amount'))['total'] or Decimal('0.00'),
             'pending_payment_ids': list(child_pending.values_list('id', flat=True)),
         }
@@ -941,7 +936,7 @@ def build_parent_payment_dashboard(children, payments):
         'current_payment_period': current_period,
         'current_pending_payment_ids': list(current_pending.values_list('id', flat=True)),
         'outstanding_monthly_payment': current_pending.aggregate(total=Sum('amount'))['total'] or Decimal('0.00'),
-        'current_amount_paid': current_paid.aggregate(total=Sum('amount'))['total'] or Decimal('0.00'),
+        'current_amount_paid': latest_payment.amount if latest_payment else Decimal('0.00'),
         'last_payment': {
             'amount': latest_payment.amount,
             'payment_period': payment_period_for_payment(latest_payment),
@@ -954,83 +949,43 @@ def build_parent_payment_dashboard(children, payments):
 
 
 def build_payment_history_rows(enrollments):
-    today = timezone.localdate()
     rows = []
     enrollment_ids = [enrollment.id for enrollment in enrollments]
-    payments = Payment.objects.filter(enrollment_id__in=enrollment_ids)
+    payments = Payment.objects.filter(enrollment_id__in=enrollment_ids).select_related(
+        'enrollment',
+        'enrollment__student',
+        'enrollment__student__parent',
+        'enrollment__course',
+    )
 
-    payments_by_period = {}
     for payment in payments:
         payment_day = payment.payment_date or (
             payment.paid_at.date() if payment.paid_at else payment.created_at.date()
         )
         month = payment.month or payment_day.month
         year = payment.year or payment_day.year
-        payments_by_period.setdefault((payment.enrollment_id, year, month), []).append(payment)
-
-    for enrollment in enrollments:
-        start = enrollment.start_date or enrollment.enrolled_at
-        end = enrollment.end_date or today
-        if end < start:
-            end = start
-
-        for period in month_sequence(start, min(end, today)):
-            period_payments = payments_by_period.get((enrollment.id, period.year, period.month), [])
-            paid_payments = [
-                payment
-                for payment in period_payments
-                if payment.status == Payment.STATUS_PAID
-            ]
-            expected_amount = course_invoice_fee(enrollment.course)
-            amount_paid = sum(
-                (payment.amount for payment in paid_payments),
-                Decimal('0.00'),
-            )
-            balance = max(expected_amount - amount_paid, Decimal('0.00'))
-
-            latest_payment = sorted(
-                period_payments,
-                key=lambda item: item.payment_date
-                or (item.paid_at.date() if item.paid_at else item.created_at.date()),
-                reverse=True,
-            )[0] if period_payments else None
-
-            if latest_payment and latest_payment.status in [Payment.STATUS_PENDING, Payment.STATUS_FAILED]:
-                payment_status = latest_payment.status
-            elif expected_amount == 0 and not paid_payments:
-                payment_status = 'unpaid'
-            elif amount_paid >= expected_amount:
-                payment_status = 'paid'
-            elif amount_paid > 0:
-                payment_status = 'partial'
-            else:
-                payment_status = 'unpaid'
-
-            rows.append(
-                {
-                    'id': latest_payment.id if latest_payment else None,
-                    'student_id': enrollment.student_id,
-                    'student_name': str(enrollment.student),
-                    'parent_name': str(enrollment.student.parent) if enrollment.student.parent else '',
-                    'parent_phone': enrollment.student.parent.phone_number if enrollment.student.parent else '',
-                    'course_title': enrollment.course.title,
-                    'month': period.month,
-                    'year': period.year,
-                    'payment_period': payment_period_label(latest_payment, period.year, period.month),
-                    'expected_amount': expected_amount,
-                    'amount_paid': amount_paid,
-                    'balance': balance,
-                    'payment_status': payment_status,
-                    'payment_method': latest_payment.payment_method if latest_payment else '',
-                    'reference': latest_payment.transaction_reference if latest_payment and latest_payment.transaction_reference else '',
-                    'payment_date': (
-                        latest_payment.payment_date
-                        or (latest_payment.paid_at.date() if latest_payment.paid_at else None)
-                    ) if latest_payment else None,
-                    'paid_at': latest_payment.paid_at if latest_payment else None,
-                    'receipt_number': latest_payment.receipt_number if latest_payment else '',
-                }
-            )
+        rows.append(
+            {
+                'id': payment.id,
+                'student_id': payment.enrollment.student_id,
+                'student_name': str(payment.enrollment.student),
+                'parent_name': str(payment.enrollment.student.parent) if payment.enrollment.student.parent else '',
+                'parent_phone': payment.enrollment.student.parent.phone_number if payment.enrollment.student.parent else '',
+                'course_title': payment.enrollment.course.title,
+                'month': month,
+                'year': year,
+                'payment_period': payment_period_label(payment, year, month),
+                'amount': payment.amount,
+                'amount_due': payment.amount if payment.status == Payment.STATUS_PENDING else Decimal('0.00'),
+                'amount_paid': payment.amount if payment.status == Payment.STATUS_PAID else Decimal('0.00'),
+                'payment_status': payment.status,
+                'payment_method': payment.payment_method,
+                'reference': payment.transaction_reference if payment.transaction_reference else '',
+                'payment_date': payment.payment_date or (payment.paid_at.date() if payment.paid_at else None),
+                'paid_at': payment.paid_at,
+                'receipt_number': payment.receipt_number if payment.receipt_number else '',
+            }
+        )
 
     return sorted(
         rows,
