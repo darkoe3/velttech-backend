@@ -30,6 +30,7 @@ from payments.views import (
     PaystackWebhookView,
 )
 from students.views import ParentViewSet, StudentViewSet
+from certificates.views import CertificateEligibilityListView, CertificateViewSet
 from users.views import (
     AdminApproveAccountView,
     AdminApproveStudentView,
@@ -78,6 +79,7 @@ router.register('students', StudentViewSet, basename='student')
 router.register('courses', CourseViewSet, basename='course')
 router.register('enrollments', EnrollmentViewSet, basename='enrollment')
 router.register('payments', PaymentViewSet, basename='payment')
+router.register('certificates', CertificateViewSet, basename='certificate')
 router.register('notifications', NotificationViewSet, basename='notification')
 
 
@@ -97,10 +99,12 @@ def api_root(request):
                 'my_children': '/api/my-children/',
                 'my_payments': '/api/my-payments/',
                 'my_assignments': '/api/my-assignments/',
+                'my_certificates': '/api/certificates/',
                 'students': '/api/students/',
                 'courses': '/api/courses/',
                 'enrollments': '/api/enrollments/',
                 'payments': '/api/payments/',
+                'certificates': '/api/certificates/',
                 'notifications': '/api/notifications/',
             },
         }
@@ -125,6 +129,7 @@ urlpatterns = [
     path('api/payments/initialize/', PaystackInitializePaymentView.as_view(), name='paystack-initialize'),
     path('api/payments/verify/', PaystackVerifyPaymentView.as_view(), name='paystack-verify'),
     path('api/payments/paystack-webhook/', PaystackWebhookView.as_view(), name='paystack-webhook'),
+    path('api/certificates/eligible/', CertificateEligibilityListView.as_view(), name='certificate-eligible'),
     path('api/my-attendance/', MyAttendanceView.as_view(), name='my_attendance'),
     path('api/my-progress/', MyProgressView.as_view(), name='my_progress'),
     path('api/my-assignments/', MyAssignmentsView.as_view(), name='my_assignments'),
