@@ -8,6 +8,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.core.mail import send_mail
 from django.db import transaction
+from django.http import FileResponse
 from django.utils.encoding import force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from django.utils.encoding import force_bytes
@@ -15,7 +16,8 @@ from django.db.models.functions import ExtractMonth
 from django.db.models import Count, Prefetch, Q, Sum
 from django.utils import timezone
 from rest_framework import generics, permissions, status
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -88,6 +90,15 @@ class IsInstructorUserRole(permissions.BasePermission):
             request.user
             and request.user.is_authenticated
             and request.user.role == User.ROLE_INSTRUCTOR
+        )
+
+
+class IsInstructorOrAdminRole(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return bool(
+            request.user
+            and request.user.is_authenticated
+            and request.user.role in [User.ROLE_INSTRUCTOR, User.ROLE_ADMIN]
         )
 
 
@@ -481,6 +492,61 @@ def visible_notifications_for(user):
     ).filter(Q(recipient__isnull=True) | Q(recipient=user))
 
 
+def notify_assignment_graded(submission):
+    assignment = submission.assignment
+    student = submission.student
+    max_score = submission.max_score or assignment.marks or 100
+    grade_label = (
+        f'{submission.score}/{max_score}'
+        if submission.score is not None
+        else 'Returned for revision'
+    )
+    feedback = submission.feedback or 'No feedback provided.'
+    message = (
+        f'{student} has received feedback for {assignment.title}.\n\n'
+        f'Grade: {grade_label}\n'
+        f'Feedback: {feedback}\n\n'
+        f'Dashboard: {settings.FRONTEND_URL.rstrip("/")}/assignments'
+    )
+
+    if student.user:
+        Notification.objects.create(
+            title='Assignment graded',
+            message=message,
+            audience=Notification.AUDIENCE_STUDENTS,
+            recipient=student.user,
+        )
+
+    if student.parent and student.parent.user:
+        Notification.objects.create(
+            title='Assignment graded',
+            message=message,
+            audience=Notification.AUDIENCE_PARENTS,
+            recipient=student.parent.user,
+        )
+
+    recipients = []
+    student_email = student_contact_email(student)
+    if student_email:
+        recipients.append(student_email)
+    parent_email = student.parent.email if student.parent and student.parent.email else ''
+    if parent_email and parent_email not in recipients:
+        recipients.append(parent_email)
+    if not recipients:
+        return
+
+    try:
+        send_mail(
+            subject='Assignment Graded - Velttech Academy',
+            message=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=recipients,
+            fail_silently=False,
+        )
+    except Exception:
+        logger.exception('Could not send assignment graded email for submission %s.', submission.pk)
+
+
 def enforce_student_approved(user):
     if user.approval_status == User.APPROVAL_PENDING:
         raise PermissionDenied(
@@ -686,6 +752,7 @@ class DashboardView(APIView):
             )
 
         if user.role == User.ROLE_STUDENT:
+            student_profile = getattr(user, 'student_profile', None)
             attendance = Attendance.objects.filter(
                 enrollment__student__user=user,
             ).select_related('enrollment__course')
@@ -712,21 +779,78 @@ class DashboardView(APIView):
             assignments = Assignment.objects.filter(
                 is_active=True,
                 course__enrollments__student__user=user,
+            ).filter(
+                Q(target_student__isnull=True) | Q(target_student__user=user)
             ).distinct()
-            student_profile = getattr(user, 'student_profile', None)
+            student_assignments = assignments.prefetch_related(
+                Prefetch(
+                    'submissions',
+                    queryset=AssignmentSubmission.objects.filter(student__user=user),
+                    to_attr='student_submissions',
+                )
+            ).order_by('due_date', '-created_at')[:5]
             latest_enrollment = Enrollment.objects.filter(
                 student__user=user,
-            ).select_related('course').order_by('-created_at').first()
+            ).select_related('course', 'instructor').order_by('-created_at').first()
+            latest_progress = progress_reports.first()
+            total_classes = attendance.count()
+            classes_attended = attendance.filter(
+                status__in=[Attendance.STATUS_PRESENT, Attendance.STATUS_LATE],
+            ).count()
+            attendance_percentage = round((classes_attended / total_classes) * 100) if total_classes else 0
+            modules_total = latest_enrollment.course.duration_months if latest_enrollment else 0
+            modules_completed = (
+                round((latest_progress.progress_score / 100) * modules_total)
+                if latest_progress and modules_total
+                else 0
+            )
+            modules_remaining = max(modules_total - modules_completed, 0)
+            current_programme_name = (
+                student_profile.programme_of_interest
+                if student_profile and student_profile.programme_of_interest
+                else (latest_enrollment.course.title if latest_enrollment else '')
+            )
+            instructor = latest_enrollment.instructor if latest_enrollment else None
+            assignment_items = []
+            for assignment in student_assignments:
+                submission = next(iter(getattr(assignment, 'student_submissions', [])), None)
+                assignment_items.append(
+                    {
+                        'id': assignment.id,
+                        'title': assignment.title,
+                        'course_title': assignment.course.title,
+                        'due_date': assignment.due_date,
+                        'submission_type': assignment.submission_type,
+                        'marks': assignment.marks,
+                        'status': submission.status if submission else AssignmentSubmission.STATUS_PENDING,
+                    }
+                )
             return Response(
                 {
                     'role': user.role,
-                    'learner_type': Student.LEARNER_ADULT,
-                    'selected_programme': (
-                        student_profile.programme_of_interest
-                        if student_profile and student_profile.programme_of_interest
-                        else (latest_enrollment.course.title if latest_enrollment else '')
-                    ),
+                    'learner_type': student_profile.learner_type if student_profile else Student.LEARNER_ADULT,
+                    'selected_programme': current_programme_name,
                     'enrollment_status': latest_enrollment.status if latest_enrollment else 'pending',
+                    'current_programme': {
+                        'name': current_programme_name or 'Pending assignment',
+                        'start_date': latest_enrollment.start_date if latest_enrollment else None,
+                        'end_date': latest_enrollment.end_date if latest_enrollment else None,
+                        'instructor': (
+                            f'{instructor.first_name} {instructor.last_name}'.strip()
+                            if instructor
+                            else 'Awaiting assignment'
+                        ),
+                    },
+                    'profile': {
+                        'name': str(student_profile) if student_profile else user.get_full_name(),
+                        'email': (
+                            student_profile.email
+                            if student_profile and student_profile.email
+                            else user.email
+                        ),
+                        'phone': student_profile.phone_number if student_profile else '',
+                        'programme': current_programme_name or 'Pending assignment',
+                    },
                     'courses': DashboardCourseSerializer(
                         visible_courses_for(user),
                         many=True,
@@ -741,14 +865,21 @@ class DashboardView(APIView):
                         'absent': attendance.filter(status=Attendance.STATUS_ABSENT).count(),
                         'late': attendance.filter(status=Attendance.STATUS_LATE).count(),
                         'excused': attendance.filter(status=Attendance.STATUS_EXCUSED).count(),
+                        'classes_attended': classes_attended,
+                        'percentage': attendance_percentage,
                     },
                     'recent_attendance': DashboardAttendanceSerializer(
                         attendance.order_by('-date', '-created_at')[:5],
                         many=True,
                     ).data,
                     'latest_progress_report': DashboardProgressReportSerializer(
-                        progress_reports.first(),
-                    ).data if progress_reports.exists() else None,
+                        latest_progress,
+                    ).data if latest_progress else None,
+                    'progress_tracker': {
+                        'modules_completed': modules_completed,
+                        'modules_remaining': modules_remaining,
+                        'progress_percentage': latest_progress.progress_score if latest_progress else 0,
+                    },
                     'assignment_summary': {
                         'total': assignments.count(),
                         'submitted': AssignmentSubmission.objects.filter(
@@ -759,13 +890,28 @@ class DashboardView(APIView):
                                 AssignmentSubmission.STATUS_GRADED,
                             ],
                         ).count(),
+                        'pending': max(
+                            assignments.count() - AssignmentSubmission.objects.filter(
+                                assignment__in=assignments,
+                                student__user=user,
+                                status__in=[
+                                    AssignmentSubmission.STATUS_SUBMITTED,
+                                    AssignmentSubmission.STATUS_GRADED,
+                                ],
+                            ).count(),
+                            0,
+                        ),
                     },
+                    'assignments': assignment_items,
                     'payment_summary': {
                         'total': payment_summary['total'] or 0,
                         'completed': payment_summary['completed'] or 0,
                         'pending': payment_summary['pending'] or 0,
                         'completed_amount': payment_summary['completed_amount'] or 0,
                         'outstanding_amount': payment_summary['outstanding_amount'] or 0,
+                        'current_payment_period': payments.order_by('-created_at').first().payment_period if payments.exists() else '',
+                        'current_amount_paid': payment_summary['completed_amount'] or 0,
+                        'outstanding_monthly_payment': payment_summary['outstanding_amount'] or 0,
                         'pending_payment_ids': pending_payment_ids,
                     },
                     'recent_payments': DashboardPaymentSerializer(
@@ -1450,45 +1596,93 @@ class InstructorProgressReportsView(generics.ListCreateAPIView):
 
 
 class InstructorAssignmentsView(generics.ListCreateAPIView):
-    permission_classes = [permissions.IsAuthenticated, IsInstructorUserRole]
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
     serializer_class = AssignmentSerializer
 
     def get_queryset(self):
-        return Assignment.objects.select_related(
+        queryset = Assignment.objects.select_related(
             'course',
+            'target_student',
             'instructor',
-        ).filter(instructor=self.request.user)
+        )
+        if self.request.user.role == User.ROLE_ADMIN:
+            return queryset
+        return queryset.filter(instructor=self.request.user)
 
     def perform_create(self, serializer):
-        serializer.save(instructor=self.request.user)
+        if self.request.user.role == User.ROLE_ADMIN:
+            instructor = serializer.validated_data.get('instructor') or self.request.user
+            serializer.save(instructor=instructor)
+        else:
+            serializer.save(instructor=self.request.user)
 
 
 class InstructorSubmissionsView(generics.ListAPIView):
-    permission_classes = [permissions.IsAuthenticated, IsInstructorUserRole]
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
     serializer_class = AssignmentSubmissionSerializer
 
     def get_queryset(self):
-        return AssignmentSubmission.objects.select_related(
+        queryset = AssignmentSubmission.objects.select_related(
             'assignment',
             'assignment__course',
+            'assignment__instructor',
             'student',
-        ).filter(assignment__instructor=self.request.user)
+            'student__parent',
+            'student__parent__user',
+            'graded_by',
+        )
+        if self.request.user.role != User.ROLE_ADMIN:
+            queryset = queryset.filter(assignment__instructor=self.request.user)
+
+        course = self.request.query_params.get('course')
+        assignment = self.request.query_params.get('assignment')
+        status_filter = self.request.query_params.get('status')
+        student = self.request.query_params.get('student')
+        if course:
+            queryset = queryset.filter(assignment__course_id=course)
+        if assignment:
+            queryset = queryset.filter(assignment_id=assignment)
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        if student:
+            queryset = queryset.filter(student_id=student)
+        return queryset
 
 
 class InstructorGradeSubmissionView(generics.UpdateAPIView):
-    permission_classes = [permissions.IsAuthenticated, IsInstructorUserRole]
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
     serializer_class = GradeAssignmentSubmissionSerializer
     http_method_names = ['patch']
 
     def get_queryset(self):
-        return AssignmentSubmission.objects.select_related(
+        queryset = AssignmentSubmission.objects.select_related(
             'assignment',
             'assignment__course',
+            'assignment__instructor',
             'student',
-        ).filter(assignment__instructor=self.request.user)
+            'student__parent',
+            'student__parent__user',
+            'student__user',
+            'graded_by',
+        )
+        if self.request.user.role == User.ROLE_ADMIN:
+            return queryset
+        return queryset.filter(assignment__instructor=self.request.user)
 
     def perform_update(self, serializer):
-        serializer.save(status=AssignmentSubmission.STATUS_GRADED)
+        status_value = serializer.validated_data.get('status') or AssignmentSubmission.STATUS_GRADED
+        submission = serializer.save(
+            status=status_value,
+            graded_by=self.request.user,
+            graded_at=timezone.now(),
+        )
+        notify_assignment_graded(submission)
+
+    def update(self, request, *args, **kwargs):
+        response = super().update(request, *args, **kwargs)
+        submission = self.get_object()
+        response.data = AssignmentSubmissionSerializer(submission, context={'request': request}).data
+        return response
 
 
 class MyAttendanceView(generics.ListAPIView):
@@ -1556,6 +1750,8 @@ class MyAssignmentsView(generics.ListAPIView):
             )
             return queryset.filter(
                 course__enrollments__student__parent__user=user,
+            ).filter(
+                Q(target_student__isnull=True) | Q(target_student__parent__user=user)
             ).distinct().prefetch_related(
                 Prefetch('submissions', queryset=visible_submissions, to_attr='visible_submissions')
             )
@@ -1566,6 +1762,8 @@ class MyAssignmentsView(generics.ListAPIView):
             )
             return queryset.filter(
                 course__enrollments__student__user=user,
+            ).filter(
+                Q(target_student__isnull=True) | Q(target_student__user=user)
             ).distinct().prefetch_related(
                 Prefetch('submissions', queryset=visible_submissions, to_attr='visible_submissions')
             )
@@ -1575,6 +1773,7 @@ class MyAssignmentsView(generics.ListAPIView):
 
 class SubmitAssignmentView(APIView):
     permission_classes = [permissions.IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def post(self, request, pk):
         user = request.user
@@ -1586,6 +1785,8 @@ class SubmitAssignmentView(APIView):
             Assignment.objects.filter(
                 is_active=True,
                 course__enrollments__student__user=user,
+            ).filter(
+                Q(target_student__isnull=True) | Q(target_student__user=user)
             ).distinct(),
             pk=pk,
         )
@@ -1593,21 +1794,76 @@ class SubmitAssignmentView(APIView):
         if not student:
             raise PermissionDenied('Student profile is required before submitting assignments.')
 
-        submission, _ = AssignmentSubmission.objects.get_or_create(
+        text_answer = (
+            request.data.get('text_answer')
+            or request.data.get('submission_text')
+            or ''
+        ).strip()
+        uploaded_file = request.FILES.get('uploaded_file')
+        has_existing_file = AssignmentSubmission.objects.filter(
             assignment=assignment,
             student=student,
+            uploaded_file__isnull=False,
+        ).exclude(uploaded_file='').exists()
+
+        if assignment.submission_type == Assignment.SUBMISSION_TEXT and not text_answer:
+            raise ValidationError({'text_answer': 'Type your answer here before submitting.'})
+        if assignment.submission_type == Assignment.SUBMISSION_FILE_UPLOAD and not uploaded_file and not has_existing_file:
+            raise ValidationError({'uploaded_file': 'Upload your assignment file before submitting.'})
+        if assignment.submission_type == Assignment.SUBMISSION_BOTH and not text_answer and not uploaded_file and not has_existing_file:
+            raise ValidationError({'detail': 'Type an answer or upload a file before submitting.'})
+
+        submission, created = AssignmentSubmission.objects.get_or_create(
+            assignment=assignment,
+            student=student,
+            defaults={'max_score': assignment.marks or 100},
         )
         if submission.status == AssignmentSubmission.STATUS_GRADED:
             raise PermissionDenied('Graded assignments cannot be resubmitted.')
 
         serializer = AssignmentSubmissionSerializer(
             submission,
-            data={'submission_text': request.data.get('submission_text', '')},
+            data={
+                'submission_text': text_answer,
+                'text_answer': text_answer,
+                **({'uploaded_file': uploaded_file} if uploaded_file else {}),
+            },
             partial=True,
+            context={'request': request},
         )
         serializer.is_valid(raise_exception=True)
-        serializer.save(
+        saved_submission = serializer.save(
             submitted_at=timezone.now(),
             status=AssignmentSubmission.STATUS_SUBMITTED,
+            max_score=(assignment.marks or submission.max_score or 100) if created else submission.max_score,
+            uploaded_file_name=uploaded_file.name if uploaded_file else submission.uploaded_file_name,
         )
-        return Response(serializer.data)
+        return Response(AssignmentSubmissionSerializer(saved_submission, context={'request': request}).data)
+
+
+class AssignmentSubmissionFileView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk):
+        enforce_student_approved(request.user)
+        submission = generics.get_object_or_404(
+            AssignmentSubmission.objects.select_related(
+                'assignment',
+                'assignment__instructor',
+                'student',
+            ),
+            pk=pk,
+        )
+        user = request.user
+        allowed = (
+            user.role == User.ROLE_ADMIN
+            or (user.role == User.ROLE_INSTRUCTOR and submission.assignment.instructor_id == user.id)
+            or (user.role == User.ROLE_STUDENT and submission.student.user_id == user.id)
+            or (user.role == User.ROLE_PARENT and submission.student.parent and submission.student.parent.user_id == user.id)
+        )
+        if not allowed:
+            raise PermissionDenied('You do not have access to this assignment file.')
+        if not submission.uploaded_file:
+            raise ValidationError({'uploaded_file': 'No uploaded file is attached to this submission.'})
+        filename = submission.uploaded_file_name or submission.uploaded_file.name.rsplit('/', 1)[-1]
+        return FileResponse(submission.uploaded_file.open('rb'), as_attachment=True, filename=filename)

@@ -1,4 +1,38 @@
+from pathlib import Path
+from uuid import uuid4
+
+from django.core.exceptions import ValidationError
 from django.db import models
+
+
+ASSIGNMENT_FILE_MAX_SIZE = 10 * 1024 * 1024
+ASSIGNMENT_FILE_EXTENSIONS = {
+    '.pdf',
+    '.doc',
+    '.docx',
+    '.png',
+    '.jpg',
+    '.jpeg',
+    '.zip',
+    '.txt',
+    '.html',
+    '.css',
+    '.js',
+    '.py',
+}
+
+
+def validate_assignment_file(uploaded_file):
+    extension = Path(uploaded_file.name).suffix.lower()
+    if extension not in ASSIGNMENT_FILE_EXTENSIONS:
+        raise ValidationError('Unsupported file type.')
+    if uploaded_file.size > ASSIGNMENT_FILE_MAX_SIZE:
+        raise ValidationError('Assignment files must be 10MB or smaller.')
+
+
+def assignment_upload_path(instance, filename):
+    extension = Path(filename).suffix.lower()
+    return f'assignments/submissions/{instance.student_id}/{uuid4().hex}{extension}'
 
 
 class Enrollment(models.Model):
@@ -150,12 +184,29 @@ class ProgressReport(models.Model):
 
 
 class Assignment(models.Model):
+    SUBMISSION_TEXT = 'text'
+    SUBMISSION_FILE_UPLOAD = 'file_upload'
+    SUBMISSION_BOTH = 'both'
+
+    SUBMISSION_TYPE_CHOICES = [
+        (SUBMISSION_TEXT, 'Text answer'),
+        (SUBMISSION_FILE_UPLOAD, 'File upload'),
+        (SUBMISSION_BOTH, 'Text + File upload'),
+    ]
+
     title = models.CharField(max_length=200)
     description = models.TextField()
     course = models.ForeignKey(
         'courses.Course',
         on_delete=models.CASCADE,
         related_name='assignments',
+    )
+    target_student = models.ForeignKey(
+        'students.Student',
+        on_delete=models.CASCADE,
+        related_name='targeted_assignments',
+        blank=True,
+        null=True,
     )
     instructor = models.ForeignKey(
         'users.User',
@@ -164,6 +215,12 @@ class Assignment(models.Model):
         limit_choices_to={'role': 'instructor'},
     )
     due_date = models.DateField()
+    submission_type = models.CharField(
+        max_length=20,
+        choices=SUBMISSION_TYPE_CHOICES,
+        default=SUBMISSION_TEXT,
+    )
+    marks = models.PositiveSmallIntegerField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     is_active = models.BooleanField(default=True)
 
@@ -178,11 +235,13 @@ class AssignmentSubmission(models.Model):
     STATUS_PENDING = 'pending'
     STATUS_SUBMITTED = 'submitted'
     STATUS_GRADED = 'graded'
+    STATUS_RETURNED = 'returned'
 
     STATUS_CHOICES = [
         (STATUS_PENDING, 'Pending'),
         (STATUS_SUBMITTED, 'Submitted'),
         (STATUS_GRADED, 'Graded'),
+        (STATUS_RETURNED, 'Returned'),
     ]
 
     assignment = models.ForeignKey(
@@ -196,9 +255,26 @@ class AssignmentSubmission(models.Model):
         related_name='assignment_submissions',
     )
     submission_text = models.TextField(blank=True)
+    text_answer = models.TextField(blank=True)
+    uploaded_file = models.FileField(
+        upload_to=assignment_upload_path,
+        validators=[validate_assignment_file],
+        blank=True,
+        null=True,
+    )
+    uploaded_file_name = models.CharField(max_length=255, blank=True)
     submitted_at = models.DateTimeField(blank=True, null=True)
     score = models.PositiveSmallIntegerField(blank=True, null=True)
+    max_score = models.PositiveSmallIntegerField(default=100)
     feedback = models.TextField(blank=True)
+    graded_by = models.ForeignKey(
+        'users.User',
+        on_delete=models.SET_NULL,
+        related_name='graded_assignment_submissions',
+        blank=True,
+        null=True,
+    )
+    graded_at = models.DateTimeField(blank=True, null=True)
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,

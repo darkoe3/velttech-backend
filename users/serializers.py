@@ -299,7 +299,9 @@ class InstructorEnrollmentSerializer(serializers.ModelSerializer):
         model = Enrollment
         fields = [
             'id',
+            'student',
             'student_name',
+            'course',
             'course_title',
             'start_date',
             'status',

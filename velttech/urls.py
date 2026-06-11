@@ -17,6 +17,8 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import include, path
 from django.http import JsonResponse
+from django.conf import settings
+from django.conf.urls.static import static
 from rest_framework.routers import DefaultRouter
 
 from courses.views import CourseViewSet
@@ -62,6 +64,7 @@ from users.views import (
     InstructorSubmissionsView,
     InstructorGradeSubmissionView,
     InstructorStudentsView,
+    AssignmentSubmissionFileView,
     MyAssignmentsView,
     MyAttendanceView,
     MyProgressView,
@@ -126,6 +129,7 @@ urlpatterns = [
     path('api/my-progress/', MyProgressView.as_view(), name='my_progress'),
     path('api/my-assignments/', MyAssignmentsView.as_view(), name='my_assignments'),
     path('api/my-assignments/<int:pk>/submit/', SubmitAssignmentView.as_view(), name='submit_assignment'),
+    path('api/my-assignments/submissions/<int:pk>/file/', AssignmentSubmissionFileView.as_view(), name='my-assignment-submission-file'),
     path('api/admin/pending-accounts/', AdminPendingAccountsView.as_view(), name='admin-pending-accounts'),
     path('api/admin/accounts/<int:pk>/approve/', AdminApproveAccountView.as_view(), name='admin-approve-account'),
     path('api/admin/accounts/<int:pk>/reject/', AdminRejectAccountView.as_view(), name='admin-reject-account'),
@@ -145,6 +149,10 @@ urlpatterns = [
     path('api/instructor/progress-reports/', InstructorProgressReportsView.as_view(), name='instructor-progress-reports'),
     path('api/instructor/assignments/', InstructorAssignmentsView.as_view(), name='instructor-assignments'),
     path('api/instructor/submissions/', InstructorSubmissionsView.as_view(), name='instructor-submissions'),
+    path('api/instructor/submissions/<int:pk>/file/', AssignmentSubmissionFileView.as_view(), name='instructor-submission-file'),
     path('api/instructor/submissions/<int:pk>/grade/', InstructorGradeSubmissionView.as_view(), name='instructor-grade-submission'),
     path('api/', include(router.urls)),
 ]
+
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
