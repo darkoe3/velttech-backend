@@ -1,38 +1,4 @@
-from pathlib import Path
-from uuid import uuid4
-
-from django.core.exceptions import ValidationError
 from django.db import models
-
-
-ASSIGNMENT_FILE_MAX_SIZE = 10 * 1024 * 1024
-ASSIGNMENT_FILE_EXTENSIONS = {
-    '.pdf',
-    '.doc',
-    '.docx',
-    '.png',
-    '.jpg',
-    '.jpeg',
-    '.zip',
-    '.txt',
-    '.html',
-    '.css',
-    '.js',
-    '.py',
-}
-
-
-def validate_assignment_file(uploaded_file):
-    extension = Path(uploaded_file.name).suffix.lower()
-    if extension not in ASSIGNMENT_FILE_EXTENSIONS:
-        raise ValidationError('Unsupported file type.')
-    if uploaded_file.size > ASSIGNMENT_FILE_MAX_SIZE:
-        raise ValidationError('Assignment files must be 10MB or smaller.')
-
-
-def assignment_upload_path(instance, filename):
-    extension = Path(filename).suffix.lower()
-    return f'assignments/submissions/{instance.student_id}/{uuid4().hex}{extension}'
 
 
 class Enrollment(models.Model):
@@ -184,14 +150,12 @@ class ProgressReport(models.Model):
 
 
 class Assignment(models.Model):
-    SUBMISSION_TEXT = 'text'
-    SUBMISSION_FILE_UPLOAD = 'file_upload'
-    SUBMISSION_BOTH = 'both'
+    ASSESSMENT_QUIZ = 'quiz'
+    ASSESSMENT_PRACTICAL = 'practical'
 
     SUBMISSION_TYPE_CHOICES = [
-        (SUBMISSION_TEXT, 'Text answer'),
-        (SUBMISSION_FILE_UPLOAD, 'File upload'),
-        (SUBMISSION_BOTH, 'Text + File upload'),
+        (ASSESSMENT_QUIZ, 'Quiz assessment'),
+        (ASSESSMENT_PRACTICAL, 'Practical assessment'),
     ]
 
     title = models.CharField(max_length=200)
@@ -218,7 +182,7 @@ class Assignment(models.Model):
     submission_type = models.CharField(
         max_length=20,
         choices=SUBMISSION_TYPE_CHOICES,
-        default=SUBMISSION_TEXT,
+        default=ASSESSMENT_QUIZ,
     )
     marks = models.PositiveSmallIntegerField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -229,6 +193,39 @@ class Assignment(models.Model):
 
     def __str__(self):
         return f'{self.course} - {self.title}'
+
+
+class AssignmentQuestion(models.Model):
+    ANSWER_A = 'A'
+    ANSWER_B = 'B'
+    ANSWER_C = 'C'
+    ANSWER_D = 'D'
+
+    ANSWER_CHOICES = [
+        (ANSWER_A, 'Option A'),
+        (ANSWER_B, 'Option B'),
+        (ANSWER_C, 'Option C'),
+        (ANSWER_D, 'Option D'),
+    ]
+
+    assignment = models.ForeignKey(
+        Assignment,
+        on_delete=models.CASCADE,
+        related_name='questions',
+    )
+    question_text = models.TextField()
+    option_a = models.CharField(max_length=255)
+    option_b = models.CharField(max_length=255)
+    option_c = models.CharField(max_length=255)
+    option_d = models.CharField(max_length=255)
+    correct_answer = models.CharField(max_length=1, choices=ANSWER_CHOICES)
+    marks = models.PositiveSmallIntegerField(default=1)
+
+    class Meta:
+        ordering = ['id']
+
+    def __str__(self):
+        return f'{self.assignment} - {self.question_text[:60]}'
 
 
 class AssignmentSubmission(models.Model):
@@ -256,13 +253,7 @@ class AssignmentSubmission(models.Model):
     )
     submission_text = models.TextField(blank=True)
     text_answer = models.TextField(blank=True)
-    uploaded_file = models.FileField(
-        upload_to=assignment_upload_path,
-        validators=[validate_assignment_file],
-        blank=True,
-        null=True,
-    )
-    uploaded_file_name = models.CharField(max_length=255, blank=True)
+    quiz_answers = models.JSONField(default=dict, blank=True)
     submitted_at = models.DateTimeField(blank=True, null=True)
     score = models.PositiveSmallIntegerField(blank=True, null=True)
     max_score = models.PositiveSmallIntegerField(default=100)

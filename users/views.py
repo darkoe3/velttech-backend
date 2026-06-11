@@ -8,7 +8,6 @@ from django.conf import settings
 from django.core.cache import cache
 from django.core.mail import send_mail
 from django.db import transaction
-from django.http import FileResponse
 from django.utils.encoding import force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from django.utils.encoding import force_bytes
@@ -17,7 +16,7 @@ from django.db.models import Count, Prefetch, Q, Sum
 from django.utils import timezone
 from rest_framework import generics, permissions, status
 from rest_framework.exceptions import PermissionDenied, ValidationError
-from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
+from rest_framework.parsers import JSONParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -511,7 +510,7 @@ def notify_assignment_graded(submission):
 
     if student.user:
         Notification.objects.create(
-            title='Assignment graded',
+            title='Assessment graded',
             message=message,
             audience=Notification.AUDIENCE_STUDENTS,
             recipient=student.user,
@@ -519,7 +518,7 @@ def notify_assignment_graded(submission):
 
     if student.parent and student.parent.user:
         Notification.objects.create(
-            title='Assignment graded',
+            title='Assessment graded',
             message=message,
             audience=Notification.AUDIENCE_PARENTS,
             recipient=student.parent.user,
@@ -537,7 +536,7 @@ def notify_assignment_graded(submission):
 
     try:
         send_mail(
-            subject='Assignment Graded - Velttech Academy',
+            subject='Assessment Graded - Velttech Academy',
             message=message,
             from_email=settings.DEFAULT_FROM_EMAIL,
             recipient_list=recipients,
@@ -1604,7 +1603,7 @@ class InstructorAssignmentsView(generics.ListCreateAPIView):
             'course',
             'target_student',
             'instructor',
-        )
+        ).prefetch_related('questions')
         if self.request.user.role == User.ROLE_ADMIN:
             return queryset
         return queryset.filter(instructor=self.request.user)
@@ -1613,6 +1612,28 @@ class InstructorAssignmentsView(generics.ListCreateAPIView):
         if self.request.user.role == User.ROLE_ADMIN:
             instructor = serializer.validated_data.get('instructor') or self.request.user
             serializer.save(instructor=instructor)
+        else:
+            serializer.save(instructor=self.request.user)
+
+
+class InstructorAssignmentDetailView(generics.RetrieveUpdateDestroyAPIView):
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
+    serializer_class = AssignmentSerializer
+    http_method_names = ['get', 'patch', 'delete']
+
+    def get_queryset(self):
+        queryset = Assignment.objects.select_related(
+            'course',
+            'target_student',
+            'instructor',
+        ).prefetch_related('questions')
+        if self.request.user.role == User.ROLE_ADMIN:
+            return queryset
+        return queryset.filter(instructor=self.request.user)
+
+    def perform_update(self, serializer):
+        if self.request.user.role == User.ROLE_ADMIN:
+            serializer.save()
         else:
             serializer.save(instructor=self.request.user)
 
@@ -1734,7 +1755,7 @@ class MyAssignmentsView(generics.ListAPIView):
     def get_queryset(self):
         user = self.request.user
         enforce_student_approved(user)
-        queryset = Assignment.objects.select_related('course', 'instructor').filter(
+        queryset = Assignment.objects.select_related('course', 'instructor').prefetch_related('questions').filter(
             is_active=True,
         )
 
@@ -1773,7 +1794,7 @@ class MyAssignmentsView(generics.ListAPIView):
 
 class SubmitAssignmentView(APIView):
     permission_classes = [permissions.IsAuthenticated]
-    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    parser_classes = [JSONParser]
 
     def post(self, request, pk):
         user = request.user
@@ -1794,24 +1815,8 @@ class SubmitAssignmentView(APIView):
         if not student:
             raise PermissionDenied('Student profile is required before submitting assignments.')
 
-        text_answer = (
-            request.data.get('text_answer')
-            or request.data.get('submission_text')
-            or ''
-        ).strip()
-        uploaded_file = request.FILES.get('uploaded_file')
-        has_existing_file = AssignmentSubmission.objects.filter(
-            assignment=assignment,
-            student=student,
-            uploaded_file__isnull=False,
-        ).exclude(uploaded_file='').exists()
-
-        if assignment.submission_type == Assignment.SUBMISSION_TEXT and not text_answer:
-            raise ValidationError({'text_answer': 'Type your answer here before submitting.'})
-        if assignment.submission_type == Assignment.SUBMISSION_FILE_UPLOAD and not uploaded_file and not has_existing_file:
-            raise ValidationError({'uploaded_file': 'Upload your assignment file before submitting.'})
-        if assignment.submission_type == Assignment.SUBMISSION_BOTH and not text_answer and not uploaded_file and not has_existing_file:
-            raise ValidationError({'detail': 'Type an answer or upload a file before submitting.'})
+        if assignment.submission_type != Assignment.ASSESSMENT_QUIZ:
+            raise ValidationError({'detail': 'Practical assessments are graded directly by your instructor.'})
 
         submission, created = AssignmentSubmission.objects.get_or_create(
             assignment=assignment,
@@ -1819,51 +1824,102 @@ class SubmitAssignmentView(APIView):
             defaults={'max_score': assignment.marks or 100},
         )
         if submission.status == AssignmentSubmission.STATUS_GRADED:
-            raise PermissionDenied('Graded assignments cannot be resubmitted.')
+            raise PermissionDenied('This quiz has already been submitted.')
 
-        serializer = AssignmentSubmissionSerializer(
-            submission,
-            data={
-                'submission_text': text_answer,
-                'text_answer': text_answer,
-                **({'uploaded_file': uploaded_file} if uploaded_file else {}),
-            },
-            partial=True,
-            context={'request': request},
-        )
-        serializer.is_valid(raise_exception=True)
-        saved_submission = serializer.save(
-            submitted_at=timezone.now(),
-            status=AssignmentSubmission.STATUS_SUBMITTED,
-            max_score=(assignment.marks or submission.max_score or 100) if created else submission.max_score,
-            uploaded_file_name=uploaded_file.name if uploaded_file else submission.uploaded_file_name,
-        )
+        answers = request.data.get('answers') or request.data.get('quiz_answers') or {}
+        if not isinstance(answers, dict):
+            raise ValidationError({'answers': 'Submit answers as an object keyed by question id.'})
+
+        questions = list(assignment.questions.all())
+        if not questions:
+            raise ValidationError({'questions': 'This quiz has no questions yet.'})
+
+        score = 0
+        max_score = 0
+        correct_count = 0
+        normalized_answers = {}
+        for question in questions:
+            max_score += question.marks
+            answer = str(answers.get(str(question.id)) or answers.get(question.id) or '').upper()
+            if answer not in {'A', 'B', 'C', 'D'}:
+                raise ValidationError({'answers': f'Answer question {question.id} with A, B, C, or D.'})
+            normalized_answers[str(question.id)] = answer
+            if answer == question.correct_answer:
+                score += question.marks
+                correct_count += 1
+
+        saved_submission = submission
+        saved_submission.quiz_answers = normalized_answers
+        saved_submission.score = score
+        saved_submission.max_score = max_score or assignment.marks or 100
+        saved_submission.feedback = f'Auto-marked: {correct_count}/{len(questions)} correct.'
+        saved_submission.submitted_at = timezone.now()
+        saved_submission.status = AssignmentSubmission.STATUS_GRADED
+        saved_submission.graded_at = timezone.now()
+        saved_submission.save(update_fields=[
+            'quiz_answers',
+            'score',
+            'max_score',
+            'feedback',
+            'submitted_at',
+            'status',
+            'graded_at',
+        ])
+        notify_assignment_graded(saved_submission)
         return Response(AssignmentSubmissionSerializer(saved_submission, context={'request': request}).data)
 
 
-class AssignmentSubmissionFileView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+class InstructorPracticalGradeView(APIView):
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
 
-    def get(self, request, pk):
-        enforce_student_approved(request.user)
-        submission = generics.get_object_or_404(
-            AssignmentSubmission.objects.select_related(
-                'assignment',
-                'assignment__instructor',
-                'student',
-            ),
-            pk=pk,
+    def post(self, request, pk):
+        queryset = Assignment.objects.select_related('course', 'instructor').filter(
+            submission_type=Assignment.ASSESSMENT_PRACTICAL,
         )
-        user = request.user
-        allowed = (
-            user.role == User.ROLE_ADMIN
-            or (user.role == User.ROLE_INSTRUCTOR and submission.assignment.instructor_id == user.id)
-            or (user.role == User.ROLE_STUDENT and submission.student.user_id == user.id)
-            or (user.role == User.ROLE_PARENT and submission.student.parent and submission.student.parent.user_id == user.id)
+        if request.user.role != User.ROLE_ADMIN:
+            queryset = queryset.filter(instructor=request.user)
+        assignment = generics.get_object_or_404(queryset, pk=pk)
+
+        student_id = request.data.get('student_id') or request.data.get('student')
+        score = request.data.get('score')
+        feedback = (request.data.get('feedback') or '').strip()
+        if student_id is None:
+            raise ValidationError({'student_id': 'Select a student to grade.'})
+        if score is None:
+            raise ValidationError({'score': 'Enter marks for this practical assessment.'})
+
+        student = generics.get_object_or_404(
+            Student.objects.filter(
+                enrollments__course=assignment.course,
+            ).filter(
+                Q(id=assignment.target_student_id) if assignment.target_student_id else Q()
+            ).distinct(),
+            pk=student_id,
         )
-        if not allowed:
-            raise PermissionDenied('You do not have access to this assignment file.')
-        if not submission.uploaded_file:
-            raise ValidationError({'uploaded_file': 'No uploaded file is attached to this submission.'})
-        filename = submission.uploaded_file_name or submission.uploaded_file.name.rsplit('/', 1)[-1]
-        return FileResponse(submission.uploaded_file.open('rb'), as_attachment=True, filename=filename)
+
+        max_score = assignment.marks or 100
+        score = int(score)
+        if score < 0 or score > max_score:
+            raise ValidationError({'score': f'Marks must be between 0 and {max_score}.'})
+
+        submission, _created = AssignmentSubmission.objects.get_or_create(
+            assignment=assignment,
+            student=student,
+            defaults={'max_score': max_score},
+        )
+        submission.score = score
+        submission.max_score = max_score
+        submission.feedback = feedback
+        submission.status = AssignmentSubmission.STATUS_GRADED
+        submission.graded_by = request.user
+        submission.graded_at = timezone.now()
+        submission.save(update_fields=[
+            'score',
+            'max_score',
+            'feedback',
+            'status',
+            'graded_by',
+            'graded_at',
+        ])
+        notify_assignment_graded(submission)
+        return Response(AssignmentSubmissionSerializer(submission, context={'request': request}).data)

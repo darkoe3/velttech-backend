@@ -1,21 +1,10 @@
-from pathlib import Path
-
 from rest_framework import serializers
 
 from courses.serializers import CourseSerializer
 from students.serializers import StudentSerializer
 from users.serializers import UserSerializer
 
-from .models import (
-    ASSIGNMENT_FILE_EXTENSIONS,
-    ASSIGNMENT_FILE_MAX_SIZE,
-    Assignment,
-    AssignmentSubmission,
-    Attendance,
-    Enrollment,
-    LessonNote,
-    ProgressReport,
-)
+from .models import Assignment, AssignmentQuestion, AssignmentSubmission, Attendance, Enrollment, LessonNote, ProgressReport
 
 
 class EnrollmentSerializer(serializers.ModelSerializer):
@@ -98,7 +87,6 @@ class LessonNoteSerializer(serializers.ModelSerializer):
             'created_at',
         ]
         read_only_fields = ['created_at']
-        extra_kwargs = {'instructor': {'required': False}}
 
     def validate_course(self, value):
         request = self.context['request']
@@ -144,10 +132,41 @@ class ProgressReportSerializer(serializers.ModelSerializer):
         return value
 
 
+class AssignmentQuestionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AssignmentQuestion
+        fields = [
+            'id',
+            'question_text',
+            'option_a',
+            'option_b',
+            'option_c',
+            'option_d',
+            'correct_answer',
+            'marks',
+        ]
+
+
+class StudentAssignmentQuestionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AssignmentQuestion
+        fields = [
+            'id',
+            'question_text',
+            'option_a',
+            'option_b',
+            'option_c',
+            'option_d',
+            'marks',
+        ]
+
+
 class AssignmentSerializer(serializers.ModelSerializer):
     course_title = serializers.CharField(source='course.title', read_only=True)
     target_student_name = serializers.SerializerMethodField()
     instructor_name = serializers.SerializerMethodField()
+    questions = AssignmentQuestionSerializer(many=True, required=False)
+    question_count = serializers.IntegerField(source='questions.count', read_only=True)
 
     class Meta:
         model = Assignment
@@ -164,10 +183,13 @@ class AssignmentSerializer(serializers.ModelSerializer):
             'due_date',
             'submission_type',
             'marks',
+            'questions',
+            'question_count',
             'created_at',
             'is_active',
         ]
         read_only_fields = ['created_at']
+        extra_kwargs = {'instructor': {'required': False}}
 
     def get_instructor_name(self, obj):
         return f'{obj.instructor.first_name} {obj.instructor.last_name}'.strip()
@@ -203,7 +225,33 @@ class AssignmentSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 'target_student': 'Selected student must be enrolled in the selected course.'
             })
+        submission_type = attrs.get('submission_type') or getattr(self.instance, 'submission_type', Assignment.ASSESSMENT_QUIZ)
+        questions = self.initial_data.get('questions')
+        if submission_type == Assignment.ASSESSMENT_QUIZ and self.instance is None and not questions:
+            raise serializers.ValidationError({'questions': 'Add at least one multiple-choice question for a quiz.'})
         return attrs
+
+    def create(self, validated_data):
+        questions = validated_data.pop('questions', [])
+        assignment = super().create(validated_data)
+        self._save_questions(assignment, questions)
+        return assignment
+
+    def update(self, instance, validated_data):
+        questions = validated_data.pop('questions', None)
+        assignment = super().update(instance, validated_data)
+        if questions is not None:
+            assignment.questions.all().delete()
+            self._save_questions(assignment, questions)
+        return assignment
+
+    def _save_questions(self, assignment, questions):
+        if assignment.submission_type != Assignment.ASSESSMENT_QUIZ:
+            return
+        AssignmentQuestion.objects.bulk_create([
+            AssignmentQuestion(assignment=assignment, **question)
+            for question in questions
+        ])
 
 
 class AssignmentSubmissionSerializer(serializers.ModelSerializer):
@@ -214,10 +262,8 @@ class AssignmentSubmissionSerializer(serializers.ModelSerializer):
     assignment_marks = serializers.IntegerField(source='assignment.marks', read_only=True)
     course_title = serializers.CharField(source='assignment.course.title', read_only=True)
     student_name = serializers.SerializerMethodField()
-    uploaded_file_url = serializers.SerializerMethodField()
     grade = serializers.IntegerField(source='score', read_only=True)
     graded_by_name = serializers.SerializerMethodField()
-    text_answer_preview = serializers.SerializerMethodField()
 
     class Meta:
         model = AssignmentSubmission
@@ -232,11 +278,7 @@ class AssignmentSubmissionSerializer(serializers.ModelSerializer):
             'course_title',
             'student',
             'student_name',
-            'submission_text',
-            'text_answer',
-            'uploaded_file',
-            'uploaded_file_name',
-            'uploaded_file_url',
+            'quiz_answers',
             'submitted_at',
             'score',
             'grade',
@@ -246,21 +288,16 @@ class AssignmentSubmissionSerializer(serializers.ModelSerializer):
             'graded_by_name',
             'graded_at',
             'status',
-            'text_answer_preview',
         ]
         read_only_fields = [
             'assignment',
             'student',
             'submitted_at',
             'status',
-            'uploaded_file_name',
-            'uploaded_file_url',
             'graded_by',
             'graded_by_name',
             'graded_at',
-            'text_answer_preview',
         ]
-        extra_kwargs = {'uploaded_file': {'write_only': True}}
 
     def get_student_name(self, obj):
         return str(obj.student)
@@ -270,36 +307,10 @@ class AssignmentSubmissionSerializer(serializers.ModelSerializer):
             return ''
         return f'{obj.graded_by.first_name} {obj.graded_by.last_name}'.strip() or obj.graded_by.email
 
-    def get_text_answer_preview(self, obj):
-        answer = obj.text_answer or obj.submission_text or ''
-        return answer[:180]
-
-    def get_uploaded_file_url(self, obj):
-        request = self.context.get('request')
-        if not obj.uploaded_file:
-            return ''
-        if request and request.user.role == 'instructor':
-            return request.build_absolute_uri(f'/api/instructor/submissions/{obj.pk}/file/')
-        if request and request.user.role == 'student' and obj.student.user_id == request.user.id:
-            return request.build_absolute_uri(f'/api/my-assignments/submissions/{obj.pk}/file/')
-        if request and request.user.role == 'parent' and obj.student.parent and obj.student.parent.user_id == request.user.id:
-            return request.build_absolute_uri(f'/api/my-assignments/submissions/{obj.pk}/file/')
-        return ''
-
     def validate_score(self, value):
         if value is not None and value > 100:
             raise serializers.ValidationError('Score must be between 0 and 100.')
         return value
-
-    def validate_uploaded_file(self, value):
-        extension = Path(value.name).suffix.lower()
-        if extension not in ASSIGNMENT_FILE_EXTENSIONS:
-            allowed = ', '.join(sorted(ASSIGNMENT_FILE_EXTENSIONS))
-            raise serializers.ValidationError(f'Unsupported file type. Allowed files: {allowed}.')
-        if value.size > ASSIGNMENT_FILE_MAX_SIZE:
-            raise serializers.ValidationError('Assignment files must be 10MB or smaller.')
-        return value
-
 
 class GradeAssignmentSubmissionSerializer(serializers.ModelSerializer):
     grade = serializers.IntegerField(source='score', required=False)
@@ -352,15 +363,12 @@ class GradeAssignmentSubmissionSerializer(serializers.ModelSerializer):
 class MyAssignmentSerializer(AssignmentSerializer):
     submission = serializers.SerializerMethodField()
     submissions = serializers.SerializerMethodField()
-    allowed_file_extensions = serializers.SerializerMethodField()
-    max_file_size_mb = serializers.SerializerMethodField()
+    questions = serializers.SerializerMethodField()
 
     class Meta(AssignmentSerializer.Meta):
         fields = AssignmentSerializer.Meta.fields + [
             'submission',
             'submissions',
-            'allowed_file_extensions',
-            'max_file_size_mb',
         ]
 
     def get_submission(self, obj):
@@ -376,8 +384,7 @@ class MyAssignmentSerializer(AssignmentSerializer):
             return []
         return AssignmentSubmissionSerializer(obj.visible_submissions, many=True, context=self.context).data
 
-    def get_allowed_file_extensions(self, obj):
-        return sorted(ASSIGNMENT_FILE_EXTENSIONS)
-
-    def get_max_file_size_mb(self, obj):
-        return ASSIGNMENT_FILE_MAX_SIZE // (1024 * 1024)
+    def get_questions(self, obj):
+        if obj.submission_type != Assignment.ASSESSMENT_QUIZ:
+            return []
+        return StudentAssignmentQuestionSerializer(obj.questions.all(), many=True).data

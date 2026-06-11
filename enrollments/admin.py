@@ -2,6 +2,7 @@ from django.contrib import admin
 
 from .models import (
     Assignment,
+    AssignmentQuestion,
     AssignmentSubmission,
     Attendance,
     Enrollment,
@@ -43,11 +44,17 @@ class ProgressReportAdmin(admin.ModelAdmin):
     search_fields = ('enrollment__student__first_name', 'enrollment__student__last_name')
 
 
+class AssignmentQuestionInline(admin.TabularInline):
+    model = AssignmentQuestion
+    extra = 1
+
+
 @admin.register(Assignment)
 class AssignmentAdmin(admin.ModelAdmin):
-    list_display = ('title', 'course', 'instructor', 'due_date', 'is_active', 'created_at')
-    list_filter = ('course', 'instructor', 'is_active', 'due_date')
+    list_display = ('title', 'course', 'instructor', 'submission_type', 'due_date', 'is_active', 'created_at')
+    list_filter = ('submission_type', 'course', 'instructor', 'is_active', 'due_date')
     search_fields = ('title', 'course__title', 'instructor__email')
+    inlines = [AssignmentQuestionInline]
 
 
 @admin.register(AssignmentSubmission)
