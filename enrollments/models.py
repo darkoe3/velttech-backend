@@ -283,3 +283,27 @@ class AssignmentSubmission(models.Model):
 
     def __str__(self):
         return f'{self.assignment} - {self.student}'
+
+    @property
+    def percentage(self):
+        if self.score is None:
+            return None
+        marks = self.assignment.marks or self.max_score
+        if not marks:
+            return None
+        return round((self.score / marks) * 100, 2)
+
+    @property
+    def letter_grade(self):
+        percentage = self.percentage
+        if percentage is None:
+            return ''
+        if percentage >= 80:
+            return 'A'
+        if percentage >= 70:
+            return 'B'
+        if percentage >= 60:
+            return 'C'
+        if percentage >= 50:
+            return 'D'
+        return 'F'

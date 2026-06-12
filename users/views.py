@@ -106,6 +106,11 @@ def signup_rate_key(kind, value):
     return f'signup-rate:{kind}:{clean_value[:120]}'
 
 
+def password_reset_rate_key(kind, value):
+    clean_value = ''.join(char if char.isalnum() else '_' for char in (value or '').lower())
+    return f'password-reset-rate:{kind}:{clean_value[:120]}'
+
+
 def bump_signup_attempt(key, timeout=600):
     if not key:
         return 0
@@ -203,11 +208,32 @@ class ChangePasswordView(generics.GenericAPIView):
 class PasswordResetRequestView(generics.GenericAPIView):
     permission_classes = [permissions.AllowAny]
     serializer_class = PasswordResetRequestSerializer
+    max_password_reset_attempts = 5
+    password_reset_timeout = 60 * 60
 
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = User.objects.filter(email__iexact=serializer.validated_data['email']).first()
+        email = serializer.validated_data['email'].strip().lower()
+        ip_address = client_ip(request) or 'unknown'
+        attempt_counts = [
+            bump_signup_attempt(
+                password_reset_rate_key('ip', ip_address),
+                timeout=self.password_reset_timeout,
+            ),
+            bump_signup_attempt(
+                password_reset_rate_key('email', email),
+                timeout=self.password_reset_timeout,
+            ),
+        ]
+
+        if max(attempt_counts) > self.max_password_reset_attempts:
+            return Response(
+                {'detail': 'Too many password reset requests. Please try again later.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        user = User.objects.filter(email__iexact=email).first()
         if user:
             uid = urlsafe_base64_encode(force_bytes(user.pk))
             token = default_token_generator.make_token(user)
@@ -1463,15 +1489,18 @@ class AdminActivityLogView(generics.ListAPIView):
 
 
 def instructor_enrollments_for(user):
-    return Enrollment.objects.select_related(
+    queryset = Enrollment.objects.select_related(
         'student',
         'student__parent',
         'course',
-    ).filter(instructor=user)
+    )
+    if user.role == User.ROLE_ADMIN:
+        return queryset
+    return queryset.filter(instructor=user)
 
 
 class InstructorDashboardView(APIView):
-    permission_classes = [permissions.IsAuthenticated, IsInstructorUserRole]
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
 
     def get(self, request):
         enrollments = instructor_enrollments_for(request.user)
@@ -1499,23 +1528,30 @@ class InstructorDashboardView(APIView):
 
 
 class InstructorCoursesView(generics.ListAPIView):
-    permission_classes = [permissions.IsAuthenticated, IsInstructorUserRole]
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
     serializer_class = InstructorCourseSerializer
 
     def get_queryset(self):
-        return Course.objects.filter(
-            enrollments__instructor=self.request.user,
-        ).annotate(
+        queryset = Course.objects.all()
+        if self.request.user.role != User.ROLE_ADMIN:
+            queryset = queryset.filter(enrollments__instructor=self.request.user)
+            return queryset.annotate(
+                assigned_students_count=Count(
+                    'enrollments__student',
+                    filter=Q(enrollments__instructor=self.request.user),
+                    distinct=True,
+                )
+            ).distinct()
+        return queryset.annotate(
             assigned_students_count=Count(
                 'enrollments__student',
-                filter=Q(enrollments__instructor=self.request.user),
                 distinct=True,
             )
         ).distinct()
 
 
 class InstructorStudentsView(generics.ListAPIView):
-    permission_classes = [permissions.IsAuthenticated, IsInstructorUserRole]
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
     serializer_class = InstructorStudentSerializer
 
     def get_queryset(self):
@@ -1524,18 +1560,17 @@ class InstructorStudentsView(generics.ListAPIView):
             enrollment.student_id: enrollment
             for enrollment in enrollments.order_by('-created_at')
         }
-        students = list(
-            Student.objects.filter(
-                enrollments__instructor=self.request.user,
-            ).select_related('parent').distinct()
-        )
+        students_queryset = Student.objects.select_related('parent')
+        if self.request.user.role != User.ROLE_ADMIN:
+            students_queryset = students_queryset.filter(enrollments__instructor=self.request.user)
+        students = list(students_queryset.distinct())
         for student in students:
             student.instructor_enrollment = enrollment_map.get(student.id)
         return students
 
 
 class InstructorEnrollmentListView(generics.ListAPIView):
-    permission_classes = [permissions.IsAuthenticated, IsInstructorUserRole]
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
     serializer_class = InstructorEnrollmentSerializer
 
     def get_queryset(self):
@@ -1543,7 +1578,7 @@ class InstructorEnrollmentListView(generics.ListAPIView):
 
 
 class InstructorNotificationsView(generics.ListAPIView):
-    permission_classes = [permissions.IsAuthenticated, IsInstructorUserRole]
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
     serializer_class = DashboardNotificationSerializer
 
     def get_queryset(self):
@@ -1551,44 +1586,53 @@ class InstructorNotificationsView(generics.ListAPIView):
 
 
 class InstructorAttendanceView(generics.ListCreateAPIView):
-    permission_classes = [permissions.IsAuthenticated, IsInstructorUserRole]
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
     serializer_class = AttendanceSerializer
 
     def get_queryset(self):
-        return Attendance.objects.select_related(
+        queryset = Attendance.objects.select_related(
             'enrollment',
             'enrollment__student',
             'enrollment__course',
-        ).filter(enrollment__instructor=self.request.user)
+        )
+        if self.request.user.role == User.ROLE_ADMIN:
+            return queryset
+        return queryset.filter(enrollment__instructor=self.request.user)
 
     def perform_create(self, serializer):
         serializer.save(recorded_by=self.request.user)
 
 
 class InstructorLessonNotesView(generics.ListCreateAPIView):
-    permission_classes = [permissions.IsAuthenticated, IsInstructorUserRole]
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
     serializer_class = LessonNoteSerializer
 
     def get_queryset(self):
-        return LessonNote.objects.select_related(
+        queryset = LessonNote.objects.select_related(
             'course',
             'instructor',
-        ).filter(instructor=self.request.user)
+        )
+        if self.request.user.role == User.ROLE_ADMIN:
+            return queryset
+        return queryset.filter(instructor=self.request.user)
 
     def perform_create(self, serializer):
         serializer.save(instructor=self.request.user)
 
 
 class InstructorProgressReportsView(generics.ListCreateAPIView):
-    permission_classes = [permissions.IsAuthenticated, IsInstructorUserRole]
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
     serializer_class = ProgressReportSerializer
 
     def get_queryset(self):
-        return ProgressReport.objects.select_related(
+        queryset = ProgressReport.objects.select_related(
             'enrollment',
             'enrollment__student',
             'enrollment__course',
-        ).filter(enrollment__instructor=self.request.user)
+        )
+        if self.request.user.role == User.ROLE_ADMIN:
+            return queryset
+        return queryset.filter(enrollment__instructor=self.request.user)
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
@@ -1691,6 +1735,12 @@ class InstructorGradeSubmissionView(generics.UpdateAPIView):
         return queryset.filter(assignment__instructor=self.request.user)
 
     def perform_update(self, serializer):
+        submission = self.get_object()
+        if self.request.user.role != User.ROLE_ADMIN and not submission.student.enrollments.filter(
+            course=submission.assignment.course,
+            instructor=self.request.user,
+        ).exists():
+            raise PermissionDenied('You can only grade students assigned to you.')
         status_value = serializer.validated_data.get('status') or AssignmentSubmission.STATUS_GRADED
         submission = serializer.save(
             status=status_value,
@@ -1896,6 +1946,11 @@ class InstructorPracticalGradeView(APIView):
             ).distinct(),
             pk=student_id,
         )
+        if request.user.role != User.ROLE_ADMIN and not student.enrollments.filter(
+            course=assignment.course,
+            instructor=request.user,
+        ).exists():
+            raise PermissionDenied('You can only grade students assigned to you.')
 
         max_score = assignment.marks or 100
         score = int(score)

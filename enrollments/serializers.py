@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
 
 from courses.serializers import CourseSerializer
 from students.serializers import StudentSerializer
@@ -221,10 +222,18 @@ class AssignmentSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({'instructor': 'Select an instructor for this assignment.'})
         course = attrs.get('course') or getattr(self.instance, 'course', None)
         target_student = attrs.get('target_student')
-        if target_student and course and not target_student.enrollments.filter(course=course).exists():
-            raise serializers.ValidationError({
-                'target_student': 'Selected student must be enrolled in the selected course.'
-            })
+        if target_student and course:
+            if not target_student.enrollments.filter(course=course).exists():
+                raise serializers.ValidationError({
+                    'target_student': 'Selected student must be enrolled in the selected course.'
+                })
+            if request.user.role == 'instructor' and not target_student.enrollments.filter(
+                course=course,
+                instructor=request.user,
+            ).exists():
+                raise PermissionDenied(
+                    'You can only assign assessments to students assigned to you.'
+                )
         submission_type = attrs.get('submission_type') or getattr(self.instance, 'submission_type', Assignment.ASSESSMENT_QUIZ)
         questions = self.initial_data.get('questions')
         if submission_type == Assignment.ASSESSMENT_QUIZ and self.instance is None and not questions:
@@ -282,6 +291,8 @@ class AssignmentSubmissionSerializer(serializers.ModelSerializer):
             'submitted_at',
             'score',
             'grade',
+            'percentage',
+            'letter_grade',
             'max_score',
             'feedback',
             'graded_by',

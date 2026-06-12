@@ -165,7 +165,7 @@ class CertificateViewSet(viewsets.ModelViewSet):
 
         certificate = get_object_or_404(
             Certificate.objects.select_related('student', 'course'),
-            verification_code=code,
+            Q(verification_code=code) | Q(certificate_number=code),
         )
 
         serializer = self.get_serializer(certificate)

@@ -22,20 +22,28 @@ def env_list(name, default):
 
 
 # SECURITY
-SECRET_KEY = os.getenv("SECRET_KEY", "unsafe-dev-secret-key")
-
 DEBUG = env_bool("DEBUG", True)
 
-if env_bool("REQUIRE_PRODUCTION_SECRETS", False) and SECRET_KEY == "unsafe-dev-secret-key":
-    raise RuntimeError("SECRET_KEY must be configured in production.")
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = "unsafe-dev-secret-key"
+    else:
+        raise RuntimeError("SECRET_KEY must be configured when DEBUG=False.")
 
-ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", [
-    "api.velttech.org",
-    "velttech-backend.onrender.com",
-    ".onrender.com",
-    "localhost",
-    "127.0.0.1",
-])
+if not DEBUG and SECRET_KEY == "unsafe-dev-secret-key":
+    raise RuntimeError("A production SECRET_KEY must be configured when DEBUG=False.")
+
+ALLOWED_HOSTS = env_list(
+    "ALLOWED_HOSTS",
+    ["localhost", "127.0.0.1"] if DEBUG else [],
+)
+if not ALLOWED_HOSTS:
+    raise RuntimeError("ALLOWED_HOSTS must be configured when DEBUG=False.")
+if not DEBUG and any(host in {"*", ""} for host in ALLOWED_HOSTS):
+    raise RuntimeError("ALLOWED_HOSTS must contain explicit hostnames when DEBUG=False.")
+if any("://" in host for host in ALLOWED_HOSTS):
+    raise RuntimeError("ALLOWED_HOSTS values must be hostnames only, without http:// or https://.")
 
 
 # CORS / CSRF

@@ -113,6 +113,32 @@ class InstructorGradingTests(APITestCase):
     def submit_url(self, assignment):
         return reverse('submit_assignment', args=[assignment.id])
 
+    def create_student_for_other_instructor(self):
+        student_user = User.objects.create_user(
+            email='other-student@example.com',
+            password='pass',
+            first_name='Una',
+            last_name='Assigned',
+            role=User.ROLE_STUDENT,
+            approval_status=User.APPROVAL_APPROVED,
+        )
+        student = Student.objects.create(
+            user=student_user,
+            parent=self.parent,
+            first_name='Una',
+            last_name='Assigned',
+            email='other-student-profile@example.com',
+            learner_type=Student.LEARNER_CHILD,
+            approval_status=Student.STATUS_APPROVED,
+        )
+        Enrollment.objects.create(
+            student=student,
+            course=self.course,
+            instructor=self.other_instructor,
+            status=Enrollment.STATUS_ACTIVE,
+        )
+        return student
+
     def test_instructor_can_grade_assigned_submission(self):
         self.client.force_authenticate(self.instructor)
         response = self.client.patch(
@@ -133,6 +159,8 @@ class InstructorGradingTests(APITestCase):
         self.assertIsNotNone(self.submission.graded_at)
         self.assertEqual(response.data['grade'], 45)
         self.assertEqual(response.data['max_score'], 50)
+        self.assertEqual(response.data['percentage'], 90.0)
+        self.assertEqual(response.data['letter_grade'], 'A')
 
     def test_grade_cannot_exceed_max_score(self):
         self.client.force_authenticate(self.instructor)
@@ -175,6 +203,52 @@ class InstructorGradingTests(APITestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_instructor_cannot_create_targeted_assignment_for_unassigned_student(self):
+        unassigned_student = self.create_student_for_other_instructor()
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.post(
+            self.assignment_list_url(),
+            {
+                'title': 'Wrong Learner',
+                'description': 'This should not be allowed.',
+                'course': self.course.id,
+                'target_student': unassigned_student.id,
+                'due_date': '2026-08-01',
+                'submission_type': Assignment.ASSESSMENT_PRACTICAL,
+                'marks': 20,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(Assignment.objects.filter(title='Wrong Learner').exists())
+
+    def test_instructor_cannot_grade_submission_for_unassigned_student(self):
+        unassigned_student = self.create_student_for_other_instructor()
+        submission = AssignmentSubmission.objects.create(
+            assignment=self.assignment,
+            student=unassigned_student,
+            status=AssignmentSubmission.STATUS_SUBMITTED,
+            max_score=50,
+        )
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.patch(
+            reverse('instructor-grade-submission', args=[submission.id]),
+            {
+                'grade': 40,
+                'feedback': 'Wrong instructor.',
+                'status': 'graded',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        submission.refresh_from_db()
+        self.assertIsNone(submission.score)
+        self.assertIsNone(submission.graded_by)
 
     def test_instructor_creates_quiz_and_student_receives_auto_marked_result(self):
         self.client.force_authenticate(self.instructor)
@@ -231,6 +305,8 @@ class InstructorGradingTests(APITestCase):
         self.assertEqual(submit_response.status_code, status.HTTP_200_OK)
         self.assertEqual(submit_response.data['score'], 10)
         self.assertEqual(submit_response.data['max_score'], 20)
+        self.assertEqual(submit_response.data['percentage'], 50.0)
+        self.assertEqual(submit_response.data['letter_grade'], 'D')
         self.assertEqual(submit_response.data['status'], AssignmentSubmission.STATUS_GRADED)
         self.assertEqual(submit_response.data['feedback'], 'Auto-marked: 1/2 correct.')
         self.assertEqual(submit_response.data['quiz_answers'][str(question_ids[0])], 'A')
@@ -311,6 +387,8 @@ class InstructorGradingTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['score'], 27)
         self.assertEqual(response.data['max_score'], 30)
+        self.assertEqual(response.data['percentage'], 90.0)
+        self.assertEqual(response.data['letter_grade'], 'A')
         self.assertEqual(response.data['feedback'], 'Strong implementation.')
         submission = AssignmentSubmission.objects.get(assignment=assignment, student=self.student)
         self.assertEqual(submission.status, AssignmentSubmission.STATUS_GRADED)
@@ -335,6 +413,49 @@ class InstructorGradingTests(APITestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_instructor_cannot_grade_practical_for_unassigned_student(self):
+        unassigned_student = self.create_student_for_other_instructor()
+        assignment = Assignment.objects.create(
+            title='Practical Wrong Learner',
+            description='Build a page.',
+            course=self.course,
+            instructor=self.instructor,
+            due_date='2026-08-05',
+            submission_type=Assignment.ASSESSMENT_PRACTICAL,
+            marks=10,
+        )
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.post(
+            reverse('instructor-practical-grade', args=[assignment.id]),
+            {'student_id': unassigned_student.id, 'score': 8, 'feedback': 'Wrong instructor.'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(
+            AssignmentSubmission.objects.filter(
+                assignment=assignment,
+                student=unassigned_student,
+            ).exists()
+        )
+
+    def test_assignment_submission_letter_grade_scale(self):
+        expectations = [
+            (80, 'A'),
+            (70, 'B'),
+            (60, 'C'),
+            (50, 'D'),
+            (49, 'F'),
+        ]
+        for score, expected_grade in expectations:
+            with self.subTest(score=score):
+                self.submission.score = score
+                self.submission.max_score = 100
+                self.assignment.marks = 100
+                self.assertEqual(self.submission.percentage, float(score))
+                self.assertEqual(self.submission.letter_grade, expected_grade)
 
     def test_instructor_edits_assignment(self):
         self.client.force_authenticate(self.instructor)

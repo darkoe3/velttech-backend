@@ -10,7 +10,7 @@ from rest_framework.test import APIClient
 
 from courses.models import Course
 from students.models import Student, Parent
-from enrollments.models import Enrollment
+from enrollments.models import Assignment, AssignmentSubmission, Attendance, Enrollment
 from payments.models import Payment
 from .models import Certificate
 
@@ -119,6 +119,8 @@ class CertificateModelTests(TestCase):
         self.assertIsNotNone(cert.certificate_number)
         self.assertTrue(cert.certificate_number.startswith('VTA-CERT-'))
         self.assertIsNotNone(cert.verification_code)
+        self.assertEqual(cert.certificate_type, Certificate.TYPE_COMPLETION)
+        self.assertIsNotNone(cert.issue_date)
 
     def test_duplicate_issued_certificate_is_blocked(self):
         """Test that certificate numbers are unique"""
@@ -188,6 +190,27 @@ class CertificateModelTests(TestCase):
         self.assertIsNotNone(cert.revoked_at)
         self.assertEqual(cert.revoke_reason, 'Test revocation')
 
+    def test_certificate_pdf_contains_required_metadata(self):
+        from .pdf_generator import CertificatePDFGenerator
+
+        cert = Certificate.objects.create(
+            student=self.student,
+            enrollment=self.enrollment,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_ISSUED,
+            issued_by=self.admin_user,
+            certificate_type=Certificate.TYPE_EXCELLENCE,
+            final_score=95,
+            final_grade='A',
+            attendance_percentage=92,
+        )
+
+        pdf_bytes = CertificatePDFGenerator(cert).generate_pdf()
+
+        self.assertTrue(pdf_bytes.startswith(b'%PDF'))
+        self.assertGreater(len(pdf_bytes), 1000)
+
 
 @override_settings(MIDDLEWARE=[])
 class CertificateAPITests(CertificateModelTests):
@@ -203,10 +226,16 @@ class CertificateAPITests(CertificateModelTests):
         response = self.client.post(reverse('certificate-issue'), {
             'enrollment_id': self.enrollment.id,
             'completion_date': date.today().isoformat(),
+            'certificate_type': Certificate.TYPE_EXCELLENCE,
+            'final_score': '95.00',
+            'final_grade': 'A',
+            'attendance_percentage': '90.00',
         }, format='json')
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.data['status'], Certificate.STATUS_ISSUED)
+        self.assertEqual(response.data['certificate_type'], Certificate.TYPE_EXCELLENCE)
+        self.assertEqual(response.data['final_grade'], 'A')
         self.assertEqual(Certificate.objects.count(), 1)
 
     @patch('certificates.pdf_generator.CertificatePDFGenerator')
@@ -261,7 +290,62 @@ class CertificateAPITests(CertificateModelTests):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data['status'], Certificate.STATUS_REVOKED)
+        self.assertEqual(response.data['status_label'], 'Revoked')
         self.assertEqual(response.data['certificate_number'], cert.certificate_number)
+
+    def test_public_verification_by_certificate_number(self):
+        cert = self._create_certificate_with_file()
+
+        response = self.client.get(reverse('certificate-verify', args=[cert.certificate_number]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['certificate_number'], cert.certificate_number)
+        self.assertEqual(response.data['student_name'], 'Student User')
+        self.assertEqual(response.data['course_title'], self.course.title)
+        self.assertEqual(response.data['status_label'], 'Valid')
+
+    @patch('certificates.pdf_generator.CertificatePDFGenerator')
+    def test_issue_certificate_calculates_score_grade_and_attendance(self, generator_cls):
+        generator_cls.return_value.save_to_certificate.return_value = None
+        assignment = Assignment.objects.create(
+            title='Final Project',
+            description='Build a project.',
+            course=self.course,
+            instructor=self.instructor,
+            due_date=date.today(),
+            submission_type=Assignment.ASSESSMENT_PRACTICAL,
+            marks=100,
+        )
+        AssignmentSubmission.objects.create(
+            assignment=assignment,
+            student=self.student,
+            score=85,
+            max_score=100,
+            status=AssignmentSubmission.STATUS_GRADED,
+        )
+        Attendance.objects.create(
+            enrollment=self.enrollment,
+            date=date(2026, 6, 1),
+            status=Attendance.STATUS_PRESENT,
+            recorded_by=self.instructor,
+        )
+        Attendance.objects.create(
+            enrollment=self.enrollment,
+            date=date(2026, 6, 2),
+            status=Attendance.STATUS_ABSENT,
+            recorded_by=self.instructor,
+        )
+        self.client.force_authenticate(self.admin_user)
+
+        response = self.client.post(reverse('certificate-issue'), {
+            'enrollment_id': self.enrollment.id,
+            'completion_date': date.today().isoformat(),
+        }, format='json')
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['final_score'], '85.00')
+        self.assertEqual(response.data['final_grade'], 'A')
+        self.assertEqual(response.data['attendance_percentage'], '50.00')
 
     def _create_certificate_with_file(self):
         cert = Certificate.objects.create(
@@ -271,6 +355,9 @@ class CertificateAPITests(CertificateModelTests):
             completion_date=date.today(),
             status=Certificate.STATUS_ISSUED,
             issued_by=self.admin_user,
+            final_score=88,
+            final_grade='A',
+            attendance_percentage=100,
         )
         cert.certificate_file.save(
             f'{cert.certificate_number}.pdf',

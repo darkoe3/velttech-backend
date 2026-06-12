@@ -9,10 +9,20 @@ class Certificate(models.Model):
     STATUS_ISSUED = 'issued'
     STATUS_REVOKED = 'revoked'
 
+    TYPE_PARTICIPATION = 'participation'
+    TYPE_COMPLETION = 'completion'
+    TYPE_EXCELLENCE = 'excellence'
+
     STATUS_CHOICES = [
         (STATUS_DRAFT, 'Draft'),
         (STATUS_ISSUED, 'Issued'),
         (STATUS_REVOKED, 'Revoked'),
+    ]
+
+    CERTIFICATE_TYPE_CHOICES = [
+        (TYPE_PARTICIPATION, 'Participation'),
+        (TYPE_COMPLETION, 'Completion'),
+        (TYPE_EXCELLENCE, 'Excellence'),
     ]
 
     certificate_number = models.CharField(
@@ -44,7 +54,16 @@ class Certificate(models.Model):
         blank=True,
     )
     issued_at = models.DateTimeField(blank=True, null=True)
+    issue_date = models.DateField(blank=True, null=True)
     completion_date = models.DateField()
+    certificate_type = models.CharField(
+        max_length=20,
+        choices=CERTIFICATE_TYPE_CHOICES,
+        default=TYPE_COMPLETION,
+    )
+    final_score = models.DecimalField(max_digits=5, decimal_places=2, blank=True, null=True)
+    final_grade = models.CharField(max_length=2, blank=True)
+    attendance_percentage = models.DecimalField(max_digits=5, decimal_places=2, blank=True, null=True)
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
@@ -72,7 +91,6 @@ class Certificate(models.Model):
             models.UniqueConstraint(
                 fields=['student', 'course'],
                 name='unique_student_course_certificate',
-                condition=models.Q(status='issued'),
             ),
         ]
 
@@ -92,6 +110,19 @@ class Certificate(models.Model):
 
         if self.status == self.STATUS_ISSUED and not self.issued_at:
             self.issued_at = timezone.now()
+        if self.status == self.STATUS_ISSUED and not self.issue_date:
+            self.issue_date = timezone.localdate()
+        if self.final_score is not None and not self.final_grade:
+            if self.final_score >= 80:
+                self.final_grade = 'A'
+            elif self.final_score >= 70:
+                self.final_grade = 'B'
+            elif self.final_score >= 60:
+                self.final_grade = 'C'
+            elif self.final_score >= 50:
+                self.final_grade = 'D'
+            else:
+                self.final_grade = 'F'
 
         super().save(*args, **kwargs)
 
