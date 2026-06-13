@@ -2,6 +2,8 @@ import uuid
 
 from django.db import models, transaction
 from django.utils import timezone
+from enrollments.models import Enrollment
+from payments.models import Payment
 
 
 class Certificate(models.Model):
@@ -133,9 +135,6 @@ class Certificate(models.Model):
         - Student status is approved
         - All payments are paid (or no outstanding payments)
         """
-        from enrollments.models import Enrollment
-        from payments.models import Payment
-
         # Check enrollment status
         if self.enrollment.status != Enrollment.STATUS_COMPLETED:
             return False
