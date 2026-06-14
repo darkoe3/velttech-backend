@@ -1,10 +1,10 @@
-from rest_framework.permissions import BasePermission, SAFE_METHODS
+from rest_framework.permissions import BasePermission
 
 
 class CanIssueCertificate(BasePermission):
     """
     Allow admin to issue any certificate.
-    Allow instructor to issue certificate for their enrolled courses.
+    Allow instructors only when explicitly granted the Django add permission.
     """
 
     def has_permission(self, request, view):
@@ -15,8 +15,7 @@ class CanIssueCertificate(BasePermission):
         if request.user.role == 'admin':
             return True
 
-        # Instructor can issue certificates
-        if request.user.role == 'instructor':
+        if request.user.role == 'instructor' and request.user.has_perm('certificates.add_certificate'):
             return True
 
         return False
@@ -68,7 +67,8 @@ class CanViewCertificate(BasePermission):
 
         # Parent can view certificates for their children
         if user.role == 'parent':
-            return obj.student.parent.user == user
+            parent = getattr(obj.student, 'parent', None)
+            return bool(parent and parent.user == user)
 
         return False
 

@@ -1,5 +1,6 @@
 import uuid
 
+from django.core.files.base import ContentFile
 from django.db import models, transaction
 from django.utils import timezone
 from enrollments.models import Enrollment
@@ -8,7 +9,9 @@ from payments.models import Payment
 
 class Certificate(models.Model):
     STATUS_DRAFT = 'draft'
-    STATUS_ISSUED = 'issued'
+    STATUS_ACTIVE = 'active'
+    STATUS_ISSUED = STATUS_ACTIVE
+    STATUS_LEGACY_ISSUED = 'issued'
     STATUS_REVOKED = 'revoked'
 
     TYPE_PARTICIPATION = 'participation'
@@ -17,7 +20,8 @@ class Certificate(models.Model):
 
     STATUS_CHOICES = [
         (STATUS_DRAFT, 'Draft'),
-        (STATUS_ISSUED, 'Issued'),
+        (STATUS_ACTIVE, 'Active'),
+        (STATUS_LEGACY_ISSUED, 'Issued (legacy)'),
         (STATUS_REVOKED, 'Revoked'),
     ]
 
@@ -66,6 +70,7 @@ class Certificate(models.Model):
     final_score = models.DecimalField(max_digits=5, decimal_places=2, blank=True, null=True)
     final_grade = models.CharField(max_length=2, blank=True)
     attendance_percentage = models.DecimalField(max_digits=5, decimal_places=2, blank=True, null=True)
+    skills_covered = models.JSONField(default=list, blank=True)
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
@@ -76,6 +81,16 @@ class Certificate(models.Model):
         unique=True,
         editable=False,
         default=uuid.uuid4,
+    )
+    qr_code = models.ImageField(
+        upload_to='certificates/qr/',
+        blank=True,
+        null=True,
+    )
+    pdf_file = models.FileField(
+        upload_to='certificates/',
+        blank=True,
+        null=True,
     )
     certificate_file = models.FileField(
         upload_to='certificates/',
@@ -102,17 +117,20 @@ class Certificate(models.Model):
     def save(self, *args, **kwargs):
         if not self.certificate_number:
             with transaction.atomic():
-                year = self.completion_date.year
-                prefix = f'VTA-CERT-{year}-'
+                year = self.issue_date.year if self.issue_date else timezone.localdate().year
+                prefix = f'VTC-{year}-'
                 last_cert = Certificate.objects.select_for_update().filter(
                     certificate_number__startswith=prefix,
                 ).order_by('-certificate_number').first()
                 last_sequence = int(last_cert.certificate_number.split('-')[-1]) if last_cert else 0
                 self.certificate_number = f'{prefix}{last_sequence + 1:06d}'
 
-        if self.status == self.STATUS_ISSUED and not self.issued_at:
+        if self.status == self.STATUS_LEGACY_ISSUED:
+            self.status = self.STATUS_ACTIVE
+
+        if self.status == self.STATUS_ACTIVE and not self.issued_at:
             self.issued_at = timezone.now()
-        if self.status == self.STATUS_ISSUED and not self.issue_date:
+        if self.status == self.STATUS_ACTIVE and not self.issue_date:
             self.issue_date = timezone.localdate()
         if self.final_score is not None and not self.final_grade:
             if self.final_score >= 80:
@@ -151,9 +169,39 @@ class Certificate(models.Model):
 
         return not outstanding_payments
 
+    def is_active(self) -> bool:
+        return self.status in {self.STATUS_ACTIVE, self.STATUS_LEGACY_ISSUED}
+
+    def get_pdf_file(self):
+        return self.pdf_file or self.certificate_file
+
+    def verification_url(self) -> str:
+        return f'https://portal.velttech.org/verify/{self.certificate_number}/'
+
+    def generate_qr_code_file(self):
+        import qrcode
+        from io import BytesIO
+
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=2,
+        )
+        qr.add_data(self.verification_url())
+        qr.make(fit=True)
+        image = qr.make_image(fill_color='black', back_color='white')
+        buffer = BytesIO()
+        image.save(buffer, format='PNG')
+        self.qr_code.save(
+            f'{self.certificate_number}-qr.png',
+            ContentFile(buffer.getvalue()),
+            save=False,
+        )
+
     def revoke(self, reason: str = ''):
         """Revoke a certificate"""
-        if self.status == self.STATUS_ISSUED:
+        if self.is_active():
             self.status = self.STATUS_REVOKED
             self.revoked_at = timezone.now()
             self.revoke_reason = reason

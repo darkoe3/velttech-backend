@@ -8,6 +8,9 @@ from .models import Certificate
 from enrollments.models import Enrollment
 
 
+CERTIFICATE_PROGRAMME_NAME = 'Young Innovators Academy'
+
+
 def grade_for_score(score):
     if score is None:
         return ''
@@ -63,6 +66,8 @@ def calculate_attendance_percentage(enrollment):
 
 class CertificateSerializer(serializers.ModelSerializer):
     student_name = serializers.SerializerMethodField()
+    programme_name = serializers.SerializerMethodField()
+    specialization_title = serializers.CharField(source='course.title', read_only=True)
     course_title = serializers.CharField(source='course.title', read_only=True)
     issued_by_name = serializers.SerializerMethodField()
     enrollment_id = serializers.IntegerField(source='enrollment.id', read_only=True)
@@ -76,6 +81,8 @@ class CertificateSerializer(serializers.ModelSerializer):
             'student_name',
             'enrollment_id',
             'course',
+            'programme_name',
+            'specialization_title',
             'course_title',
             'issued_by',
             'issued_by_name',
@@ -86,8 +93,12 @@ class CertificateSerializer(serializers.ModelSerializer):
             'final_score',
             'final_grade',
             'attendance_percentage',
+            'skills_covered',
             'status',
             'verification_code',
+            'qr_code',
+            'pdf_file',
+            'certificate_file',
             'revoked_at',
             'created_at',
             'updated_at',
@@ -98,6 +109,9 @@ class CertificateSerializer(serializers.ModelSerializer):
             'issued_at',
             'issue_date',
             'verification_code',
+            'qr_code',
+            'pdf_file',
+            'certificate_file',
             'created_at',
             'updated_at',
         ]
@@ -105,6 +119,9 @@ class CertificateSerializer(serializers.ModelSerializer):
     def get_student_name(self, obj):
         names = [obj.student.first_name, obj.student.other_name, obj.student.last_name]
         return ' '.join(name for name in names if name)
+
+    def get_programme_name(self, obj):
+        return CERTIFICATE_PROGRAMME_NAME
 
     def get_issued_by_name(self, obj):
         if obj.issued_by:
@@ -114,6 +131,8 @@ class CertificateSerializer(serializers.ModelSerializer):
 
 class CertificateListSerializer(serializers.ModelSerializer):
     student_name = serializers.SerializerMethodField()
+    programme_name = serializers.SerializerMethodField()
+    specialization_title = serializers.CharField(source='course.title', read_only=True)
     course_title = serializers.CharField(source='course.title', read_only=True)
 
     class Meta:
@@ -123,12 +142,13 @@ class CertificateListSerializer(serializers.ModelSerializer):
             'certificate_number',
             'student',
             'student_name',
+            'course',
+            'programme_name',
+            'specialization_title',
             'course_title',
             'status',
             'certificate_type',
-            'final_score',
-            'final_grade',
-            'attendance_percentage',
+            'skills_covered',
             'completion_date',
             'issue_date',
             'issued_at',
@@ -138,6 +158,9 @@ class CertificateListSerializer(serializers.ModelSerializer):
     def get_student_name(self, obj):
         names = [obj.student.first_name, obj.student.other_name, obj.student.last_name]
         return ' '.join(name for name in names if name)
+
+    def get_programme_name(self, obj):
+        return CERTIFICATE_PROGRAMME_NAME
 
 
 class CertificateIssuanceSerializer(serializers.Serializer):
@@ -162,6 +185,11 @@ class CertificateIssuanceSerializer(serializers.Serializer):
         required=False,
         min_value=Decimal('0'),
         max_value=Decimal('100'),
+    )
+    skills_covered = serializers.ListField(
+        child=serializers.CharField(max_length=80),
+        required=False,
+        allow_empty=True,
     )
 
     def validate_enrollment_id(self, value):
@@ -190,6 +218,16 @@ class CertificateIssuanceSerializer(serializers.Serializer):
         if request and request.user.role == 'instructor' and enrollment.instructor_id != request.user.id:
             raise serializers.ValidationError(
                 "You can only issue certificates for your assigned learners."
+            )
+
+        final_score = data.get('final_score', calculate_final_score(enrollment))
+        certificate_type = data.get('certificate_type', default_certificate_type(final_score))
+
+        if certificate_type == Certificate.TYPE_EXCELLENCE and (
+            final_score is None or Decimal(final_score) < Decimal('90')
+        ):
+            raise serializers.ValidationError(
+                "Excellence certificates require an academy excellence score of at least 90%."
             )
 
         certificate = Certificate(
@@ -235,7 +273,8 @@ class CertificateIssuanceSerializer(serializers.Serializer):
                 'final_score': final_score,
                 'final_grade': final_grade,
                 'attendance_percentage': attendance_percentage,
-                'status': Certificate.STATUS_ISSUED,
+                'skills_covered': validated_data.get('skills_covered', []),
+                'status': Certificate.STATUS_ACTIVE,
                 'issued_by': user,
                 'issued_at': timezone.now(),
                 'issue_date': timezone.localdate(),
@@ -243,7 +282,7 @@ class CertificateIssuanceSerializer(serializers.Serializer):
         )
 
         if not created and certificate.status == Certificate.STATUS_DRAFT:
-            certificate.status = Certificate.STATUS_ISSUED
+            certificate.status = Certificate.STATUS_ACTIVE
             certificate.issued_by = user
             certificate.issued_at = timezone.now()
             certificate.issue_date = timezone.localdate()
@@ -252,6 +291,7 @@ class CertificateIssuanceSerializer(serializers.Serializer):
             certificate.final_score = final_score
             certificate.final_grade = final_grade
             certificate.attendance_percentage = attendance_percentage
+            certificate.skills_covered = validated_data.get('skills_covered', [])
             certificate.save()
 
         return certificate
@@ -259,8 +299,11 @@ class CertificateIssuanceSerializer(serializers.Serializer):
 
 class PublicCertificateVerificationSerializer(serializers.ModelSerializer):
     student_name = serializers.SerializerMethodField()
+    programme_name = serializers.SerializerMethodField()
+    specialization_title = serializers.CharField(source='course.title', read_only=True)
     course_title = serializers.CharField(source='course.title', read_only=True)
     issue_date = serializers.DateField(read_only=True)
+    issued_by_name = serializers.SerializerMethodField()
     status_label = serializers.SerializerMethodField()
 
     class Meta:
@@ -268,14 +311,14 @@ class PublicCertificateVerificationSerializer(serializers.ModelSerializer):
         fields = [
             'certificate_number',
             'student_name',
+            'programme_name',
+            'specialization_title',
             'course_title',
+            'issued_by_name',
             'issue_date',
             'certificate_type',
             'completion_date',
             'issued_at',
-            'final_grade',
-            'final_score',
-            'attendance_percentage',
             'status',
             'status_label',
         ]
@@ -284,9 +327,15 @@ class PublicCertificateVerificationSerializer(serializers.ModelSerializer):
         names = [obj.student.first_name, obj.student.other_name, obj.student.last_name]
         return ' '.join(name for name in names if name)
 
+    def get_programme_name(self, obj):
+        return CERTIFICATE_PROGRAMME_NAME
+
+    def get_issued_by_name(self, obj):
+        return 'Velttech Academy'
+
     def get_status_label(self, obj):
         if obj.status == Certificate.STATUS_REVOKED:
             return 'Revoked'
-        if obj.status == Certificate.STATUS_ISSUED:
+        if obj.is_active():
             return 'Valid'
         return 'Draft'

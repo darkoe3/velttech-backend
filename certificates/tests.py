@@ -12,6 +12,7 @@ from courses.models import Course
 from students.models import Student, Parent
 from enrollments.models import Assignment, AssignmentSubmission, Attendance, Enrollment
 from payments.models import Payment
+from users.models import ActivityLog
 from .models import Certificate
 
 User = get_user_model()
@@ -117,7 +118,7 @@ class CertificateModelTests(TestCase):
         )
 
         self.assertIsNotNone(cert.certificate_number)
-        self.assertTrue(cert.certificate_number.startswith('VTA-CERT-'))
+        self.assertTrue(cert.certificate_number.startswith('VTC-'))
         self.assertIsNotNone(cert.verification_code)
         self.assertEqual(cert.certificate_type, Certificate.TYPE_COMPLETION)
         self.assertIsNotNone(cert.issue_date)
@@ -233,10 +234,11 @@ class CertificateAPITests(CertificateModelTests):
         }, format='json')
 
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.data['status'], Certificate.STATUS_ISSUED)
+        self.assertEqual(response.data['status'], Certificate.STATUS_ACTIVE)
         self.assertEqual(response.data['certificate_type'], Certificate.TYPE_EXCELLENCE)
         self.assertEqual(response.data['final_grade'], 'A')
         self.assertEqual(Certificate.objects.count(), 1)
+        self.assertTrue(ActivityLog.objects.filter(action='Certificate issued').exists())
 
     @patch('certificates.pdf_generator.CertificatePDFGenerator')
     def test_instructor_can_only_issue_assigned_certificate(self, generator_cls):
@@ -248,8 +250,7 @@ class CertificateAPITests(CertificateModelTests):
             'completion_date': date.today().isoformat(),
         }, format='json')
 
-        self.assertEqual(response.status_code, 400)
-        self.assertIn('assigned learners', str(response.data))
+        self.assertEqual(response.status_code, 403)
 
     @patch('certificates.pdf_generator.CertificatePDFGenerator')
     def test_duplicate_certificate_is_blocked(self, generator_cls):
@@ -273,6 +274,7 @@ class CertificateAPITests(CertificateModelTests):
         response = self.client.get(reverse('certificate-download', args=[cert.id]))
 
         self.assertEqual(response.status_code, 200)
+        self.assertTrue(ActivityLog.objects.filter(action='Certificate downloaded').exists())
 
     def test_parent_downloads_child_certificate(self):
         cert = self._create_certificate_with_file()
@@ -281,6 +283,22 @@ class CertificateAPITests(CertificateModelTests):
         response = self.client.get(reverse('certificate-download', args=[cert.id]))
 
         self.assertEqual(response.status_code, 200)
+
+    def test_student_cannot_download_another_students_certificate(self):
+        cert = self._create_other_student_certificate_with_file()
+        self.client.force_authenticate(self.student_user)
+
+        response = self.client.get(reverse('certificate-download', args=[cert.id]))
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_parent_cannot_download_unlinked_child_certificate(self):
+        cert = self._create_other_student_certificate_with_file()
+        self.client.force_authenticate(self.parent_user)
+
+        response = self.client.get(reverse('certificate-download', args=[cert.id]))
+
+        self.assertEqual(response.status_code, 404)
 
     def test_public_verification_and_revoked_status(self):
         cert = self._create_certificate_with_file()
@@ -292,6 +310,10 @@ class CertificateAPITests(CertificateModelTests):
         self.assertEqual(response.data['status'], Certificate.STATUS_REVOKED)
         self.assertEqual(response.data['status_label'], 'Revoked')
         self.assertEqual(response.data['certificate_number'], cert.certificate_number)
+        self.assertNotIn('final_score', response.data)
+        self.assertNotIn('final_grade', response.data)
+        self.assertNotIn('attendance_percentage', response.data)
+        self.assertTrue(ActivityLog.objects.filter(action='Certificate verified').exists())
 
     def test_public_verification_by_certificate_number(self):
         cert = self._create_certificate_with_file()
@@ -301,8 +323,25 @@ class CertificateAPITests(CertificateModelTests):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data['certificate_number'], cert.certificate_number)
         self.assertEqual(response.data['student_name'], 'Student User')
+        self.assertEqual(response.data['programme_name'], 'Young Innovators Academy')
+        self.assertEqual(response.data['specialization_title'], self.course.title)
         self.assertEqual(response.data['course_title'], self.course.title)
+        self.assertEqual(response.data['issued_by_name'], 'Velttech Academy')
         self.assertEqual(response.data['status_label'], 'Valid')
+
+    def test_certificate_list_keeps_assessment_metrics_off_certificate_surface(self):
+        cert = self._create_certificate_with_file()
+        self.client.force_authenticate(self.student_user)
+
+        response = self.client.get(reverse('certificate-list'))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data[0]['certificate_number'], cert.certificate_number)
+        self.assertEqual(response.data[0]['programme_name'], 'Young Innovators Academy')
+        self.assertEqual(response.data[0]['specialization_title'], self.course.title)
+        self.assertNotIn('final_score', response.data[0])
+        self.assertNotIn('final_grade', response.data[0])
+        self.assertNotIn('attendance_percentage', response.data[0])
 
     @patch('certificates.pdf_generator.CertificatePDFGenerator')
     def test_issue_certificate_calculates_score_grade_and_attendance(self, generator_cls):
@@ -358,6 +397,65 @@ class CertificateAPITests(CertificateModelTests):
             final_score=88,
             final_grade='A',
             attendance_percentage=100,
+        )
+        cert.certificate_file.save(
+            f'{cert.certificate_number}.pdf',
+            ContentFile(b'%PDF-1.4 certificate'),
+            save=True,
+        )
+        return cert
+
+    def _create_other_student_certificate_with_file(self):
+        other_parent_user = User.objects.create_user(
+            email='other-parent@test.com',
+            password='testpass123',
+            first_name='Other',
+            last_name='Parent',
+            role='parent',
+            approval_status='approved',
+        )
+        other_parent = Parent.objects.create(
+            user=other_parent_user,
+            first_name='Other',
+            last_name='Parent',
+            email='other-parent-profile@test.com',
+            phone_number='0244000000',
+        )
+        other_student_user = User.objects.create_user(
+            email='other-student@test.com',
+            password='testpass123',
+            first_name='Other',
+            last_name='Student',
+            role='student',
+            approval_status='approved',
+        )
+        other_student = Student.objects.create(
+            user=other_student_user,
+            parent=other_parent,
+            first_name='Other',
+            last_name='Student',
+            email='other-student-profile@test.com',
+            learner_type='child',
+            approval_status='approved',
+        )
+        other_enrollment = Enrollment.objects.create(
+            student=other_student,
+            course=self.course,
+            instructor=self.instructor,
+            status='completed',
+        )
+        Payment.objects.create(
+            enrollment=other_enrollment,
+            amount=300.00,
+            status='paid',
+        )
+        cert = Certificate.objects.create(
+            student=other_student,
+            enrollment=other_enrollment,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_ISSUED,
+            issued_by=self.admin_user,
         )
         cert.certificate_file.save(
             f'{cert.certificate_number}.pdf',

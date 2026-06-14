@@ -1,3 +1,5 @@
+import csv
+
 from rest_framework import viewsets, status, generics
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -5,6 +7,8 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from django.shortcuts import get_object_or_404
 from django.http import FileResponse, HttpResponse
 from django.db.models import Q
+from django.utils import timezone
+from users.models import ActivityLog
 
 from .models import Certificate
 from .serializers import (
@@ -18,6 +22,24 @@ from .permissions import (
     CanViewCertificate,
     CanRevokeCertificate,
 )
+
+
+def _client_ip(request):
+    forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+    if forwarded_for:
+        return forwarded_for.split(',')[0].strip()
+    return request.META.get('REMOTE_ADDR')
+
+
+def log_certificate_activity(request, action, certificate, description):
+    user = request.user if getattr(request, 'user', None) and request.user.is_authenticated else None
+    ActivityLog.objects.create(
+        user=user,
+        action=action,
+        description=description,
+        ip_address=_client_ip(request),
+        role=getattr(user, 'role', '') if user else '',
+    )
 
 
 class CertificateViewSet(viewsets.ModelViewSet):
@@ -59,6 +81,11 @@ class CertificateViewSet(viewsets.ModelViewSet):
         certificate_status = self.request.query_params.get('status')
         course_id = self.request.query_params.get('course_id')
         student_id = self.request.query_params.get('student_id')
+        certificate_type = self.request.query_params.get('certificate_type')
+        search = self.request.query_params.get('search')
+
+        if certificate_status == 'issued':
+            certificate_status = Certificate.STATUS_ACTIVE
 
         if certificate_status:
             queryset = queryset.filter(status=certificate_status)
@@ -66,6 +93,15 @@ class CertificateViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(course_id=course_id)
         if student_id:
             queryset = queryset.filter(student_id=student_id)
+        if certificate_type:
+            queryset = queryset.filter(certificate_type=certificate_type)
+        if search:
+            queryset = queryset.filter(
+                Q(certificate_number__icontains=search)
+                | Q(student__first_name__icontains=search)
+                | Q(student__last_name__icontains=search)
+                | Q(course__title__icontains=search)
+            )
 
         if user.role == 'admin':
             return queryset
@@ -103,6 +139,13 @@ class CertificateViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        log_certificate_activity(
+            request,
+            'Certificate issued',
+            certificate,
+            f'{certificate.certificate_number} issued to {certificate.student} for {certificate.course}.',
+        )
+
         return Response(
             CertificateSerializer(certificate).data,
             status=status.HTTP_201_CREATED
@@ -113,14 +156,22 @@ class CertificateViewSet(viewsets.ModelViewSet):
         """Download certificate PDF"""
         certificate = self.get_object()
 
-        if not certificate.certificate_file:
+        pdf_file = certificate.get_pdf_file()
+        if not pdf_file:
             return Response(
                 {'error': 'Certificate file not available'},
                 status=status.HTTP_404_NOT_FOUND
             )
 
+        log_certificate_activity(
+            request,
+            'Certificate downloaded',
+            certificate,
+            f'{certificate.certificate_number} downloaded.',
+        )
+
         return FileResponse(
-            certificate.certificate_file.open('rb'),
+            pdf_file.open('rb'),
             as_attachment=True,
             filename=f"{certificate.certificate_number}.pdf"
         )
@@ -135,6 +186,12 @@ class CertificateViewSet(viewsets.ModelViewSet):
         reason = request.data.get('reason', '')
 
         if certificate.revoke(reason):
+            log_certificate_activity(
+                request,
+                'Certificate revoked',
+                certificate,
+                f'{certificate.certificate_number} revoked. Reason: {reason or "Not provided"}.',
+            )
             return Response(
                 CertificateSerializer(certificate).data,
                 status=status.HTTP_200_OK
@@ -169,8 +226,74 @@ class CertificateViewSet(viewsets.ModelViewSet):
         )
 
         serializer = self.get_serializer(certificate)
+        log_certificate_activity(
+            request,
+            'Certificate verified',
+            certificate,
+            f'{certificate.certificate_number} was checked on the public verification page.',
+        )
         return Response(serializer.data)
 
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def reissue(self, request, pk=None):
+        """Regenerate the certificate PDF and reactivate a revoked certificate."""
+        self.permission_classes = [IsAuthenticated, CanRevokeCertificate]
+        self.check_permissions(request)
+
+        certificate = self.get_object()
+        certificate.status = Certificate.STATUS_ACTIVE
+        certificate.revoked_at = None
+        certificate.revoke_reason = ''
+        certificate.issued_by = request.user
+        certificate.issued_at = timezone.now()
+        certificate.issue_date = timezone.localdate()
+        certificate.save()
+
+        from .pdf_generator import CertificatePDFGenerator
+
+        CertificatePDFGenerator(certificate).save_to_certificate()
+        log_certificate_activity(
+            request,
+            'Certificate reissued',
+            certificate,
+            f'{certificate.certificate_number} was reissued.',
+        )
+        return Response(CertificateSerializer(certificate).data, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated], url_path='export')
+    def export(self, request):
+        """Export the filtered certificate list as an Excel-compatible CSV file."""
+        if request.user.role != 'admin':
+            return Response({'detail': 'Admin access required.'}, status=status.HTTP_403_FORBIDDEN)
+
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="certificates.csv"'
+        writer = csv.writer(response)
+        writer.writerow([
+            'Certificate Number',
+            'Student Name',
+            'Programme',
+            'Specialization',
+            'Certificate Type',
+            'Issue Date',
+            'Status',
+        ])
+        for certificate in self.filter_queryset(self.get_queryset()):
+            names = [
+                certificate.student.first_name,
+                certificate.student.other_name,
+                certificate.student.last_name,
+            ]
+            writer.writerow([
+                certificate.certificate_number,
+                ' '.join(name for name in names if name),
+                'Young Innovators Academy',
+                certificate.course.title,
+                certificate.get_certificate_type_display(),
+                certificate.issue_date.isoformat() if certificate.issue_date else '',
+                'Active' if certificate.is_active() else certificate.get_status_display(),
+            ])
+        return response
 
 class CertificateEligibilityListView(generics.ListAPIView):
     """
@@ -221,7 +344,7 @@ class CertificateEligibilityListView(generics.ListAPIView):
             # Check if already has issued certificate
             has_issued = Certificate.objects.filter(
                 enrollment=enrollment,
-                status=Certificate.STATUS_ISSUED,
+                status__in=[Certificate.STATUS_ACTIVE, Certificate.STATUS_LEGACY_ISSUED],
             ).exists()
 
             certificate_probe = Certificate(
