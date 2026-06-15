@@ -4,7 +4,7 @@ from pathlib import Path
 
 from django.core.files.base import ContentFile
 from django.conf import settings
-from .models import Certificate
+from .models import Certificate, CertificateBranding
 
 
 # Velttech Brand Colors
@@ -63,23 +63,24 @@ class CertificatePDFGenerator:
         pdf.setLineWidth(1.5)
         pdf.rect(0.55 * inch, 0.55 * inch, page_width - 1.1 * inch, page_height - 1.1 * inch)
 
-        logo_path = Path(settings.BASE_DIR).parent / 'frontend' / 'public' / 'images' / 'velttech-logo.png'
-        if logo_path.exists():
-            pdf.drawImage(
-                str(logo_path),
-                (page_width - 1.8 * inch) / 2,
-                page_height - 1.25 * inch,
-                width=1.8 * inch,
-                height=0.78 * inch,
-                preserveAspectRatio=True,
-                mask='auto',
+        branding = CertificateBranding.current()
+        logo_path = self._academy_logo_path(branding)
+        logo_drawn = False
+        if logo_path:
+            logo_drawn = self._draw_image_fit(
+                pdf,
+                logo_path,
+                (page_width - 1.75 * inch) / 2,
+                page_height - 1.28 * inch,
+                1.75 * inch,
+                0.68 * inch,
             )
-
-        pdf.setFillColor(dark)
-        pdf.setFont('Helvetica-Bold', 16)
-        pdf.drawCentredString(page_width / 2, page_height - 1.36 * inch, 'VELTTECH')
-        pdf.setFont('Helvetica-Bold', 14)
-        pdf.drawCentredString(page_width / 2, page_height - 1.62 * inch, 'YOUNG INNOVATORS ACADEMY')
+        if not logo_drawn:
+            pdf.setFillColor(dark)
+            pdf.setFont('Helvetica-Bold', 16)
+            pdf.drawCentredString(page_width / 2, page_height - 0.92 * inch, 'VELTTECH')
+            pdf.setFont('Helvetica-Bold', 14)
+            pdf.drawCentredString(page_width / 2, page_height - 1.16 * inch, 'Young Innovators Academy')
 
         certificate_title = 'CERTIFICATE OF COMPLETION'
         pdf.setFillColor(gold)
@@ -160,17 +161,26 @@ class CertificatePDFGenerator:
         pdf.setFont('Helvetica-Oblique', 9)
         pdf.drawCentredString(page_width / 2, 1.65 * inch, f'Verify online: {verification_url}')
 
-        pdf.setStrokeColor(dark)
-        pdf.setLineWidth(1)
-        pdf.line(1.4 * inch, 1.15 * inch, 3.45 * inch, 1.15 * inch)
-        pdf.line(page_width - 3.45 * inch, 1.15 * inch, page_width - 1.4 * inch, 1.15 * inch)
-        pdf.setFillColor(dark)
-        pdf.setFont('Helvetica-Bold', 10)
-        pdf.drawCentredString(2.425 * inch, 0.93 * inch, 'Director')
-        pdf.drawCentredString(page_width - 2.425 * inch, 0.93 * inch, 'Instructor')
-        pdf.setFont('Helvetica', 8)
-        pdf.drawCentredString(2.425 * inch, 0.78 * inch, 'Signature')
-        pdf.drawCentredString(page_width - 2.425 * inch, 0.78 * inch, 'Signature')
+        director_signature_path = self._file_field_path(getattr(branding, 'director_signature', None))
+        instructor_signature_path = self._instructor_signature_path()
+        self._draw_signature_block(
+            pdf,
+            1.35 * inch,
+            1.12 * inch,
+            2.35 * inch,
+            'Academy Director',
+            director_signature_path,
+            dark,
+        )
+        self._draw_signature_block(
+            pdf,
+            page_width - 3.55 * inch,
+            1.12 * inch,
+            2.15 * inch,
+            'Course Instructor',
+            instructor_signature_path,
+            dark,
+        )
 
         pdf.setFont('Helvetica', 8)
         pdf.drawCentredString(page_width / 2, 0.62 * inch, f'Verification Code: {self.certificate.verification_code}')
@@ -256,6 +266,71 @@ class CertificatePDFGenerator:
 
         for index, line in enumerate(lines):
             pdf.drawCentredString(center_x, start_y - (index * line_height), line)
+
+    def _academy_logo_path(self, branding):
+        configured_logo = self._file_field_path(getattr(branding, 'academy_logo', None))
+        if configured_logo:
+            return configured_logo
+
+        public_logo = Path(settings.BASE_DIR).parent / 'frontend' / 'public' / 'images' / 'velttech-logo.png'
+        if public_logo.exists():
+            return str(public_logo)
+        return None
+
+    def _instructor_signature_path(self):
+        instructor = getattr(self.certificate.enrollment, 'instructor', None)
+        return self._file_field_path(getattr(instructor, 'instructor_signature', None))
+
+    def _file_field_path(self, field_file):
+        if not field_file:
+            return None
+        try:
+            path = field_file.path
+        except (NotImplementedError, ValueError, AttributeError):
+            return None
+        return path if path and Path(path).exists() else None
+
+    def _draw_image_fit(self, pdf, image_path, x, y, max_width, max_height):
+        try:
+            from reportlab.lib.utils import ImageReader
+
+            image = ImageReader(image_path)
+            image_width, image_height = image.getSize()
+            scale = min(max_width / image_width, max_height / image_height)
+            width = image_width * scale
+            height = image_height * scale
+            pdf.drawImage(
+                image,
+                x + (max_width - width) / 2,
+                y + (max_height - height) / 2,
+                width=width,
+                height=height,
+                preserveAspectRatio=True,
+                mask='auto',
+            )
+            return True
+        except Exception:
+            return False
+
+    def _draw_signature_block(self, pdf, x, line_y, width, label, signature_path, color):
+        from reportlab.lib.units import inch
+
+        if signature_path:
+            self._draw_image_fit(
+                pdf,
+                signature_path,
+                x + 0.15 * inch,
+                line_y + 0.08 * inch,
+                width - 0.3 * inch,
+                0.46 * inch,
+            )
+
+        pdf.setStrokeColor(color)
+        pdf.setLineWidth(1)
+        pdf.line(x, line_y, x + width, line_y)
+        pdf.setFillColor(color)
+        pdf.setFont('Helvetica-Bold', 10)
+        pdf.drawCentredString(x + width / 2, line_y - 0.22 * inch, label)
 
     def _skills(self):
         if self.certificate.skills_covered:

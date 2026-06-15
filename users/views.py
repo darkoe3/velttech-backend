@@ -298,27 +298,62 @@ def student_course_summary(student):
 
 
 def course_invoice_fee(course):
-    fee = getattr(course, 'fee', None)
-    if fee:
-        return fee
     return getattr(course, 'monthly_fee', Decimal('0.00')) or Decimal('0.00')
 
 
-def create_pending_invoice_for_enrollment(enrollment):
+PAYMENT_PERIOD_MONTHS = [
+    '',
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December',
+]
+
+
+def payment_period_label(payment, year, month):
+    if payment and payment.payment_period:
+        return payment.payment_period
+    if month and year and 1 <= month <= 12:
+        return f'{PAYMENT_PERIOD_MONTHS[month]} {year}'
+    return str(year) if year else ''
+
+
+def current_payment_period(today=None):
+    today = today or timezone.localdate()
+    return payment_period_label(None, today.year, today.month)
+
+
+def payment_current_period_query(period, today=None):
+    today = today or timezone.localdate()
+    query = Q(payment_period=period)
+    if period == current_payment_period(today):
+        query |= Q(payment_period='', month=today.month, year=today.year)
+    return query
+
+
+def create_pending_invoice_for_enrollment(enrollment, payment_period=None):
     enrollment = Enrollment.objects.select_related(
         'student',
         'student__parent',
         'course',
     ).select_for_update().get(pk=enrollment.pk)
+    today = timezone.localdate()
+    period = payment_period or current_payment_period(today)
     existing_payment = Payment.objects.filter(
         enrollment__student=enrollment.student,
         enrollment__course=enrollment.course,
-        status__in=[Payment.STATUS_PENDING, Payment.STATUS_PAID],
-    ).first()
+    ).filter(payment_current_period_query(period, today)).first()
     if existing_payment:
         return existing_payment, False
 
-    today = timezone.localdate()
     payment = Payment.objects.create(
         enrollment=enrollment,
         amount=course_invoice_fee(enrollment.course),
@@ -326,6 +361,7 @@ def create_pending_invoice_for_enrollment(enrollment):
         status=Payment.STATUS_PENDING,
         month=today.month,
         year=today.year,
+        payment_period=period,
         notes='Automatically generated when student was approved or enrolled.',
     )
     return payment, True
@@ -402,6 +438,7 @@ def send_adult_signup_pending_email(student):
 
 
 def send_parent_account_approval_email(user):
+    login_url = f'{settings.FRONTEND_URL.rstrip("/")}/login'
     send_mail(
         subject='Welcome to Velttech Coding Academy',
         message=(
@@ -409,7 +446,7 @@ def send_parent_account_approval_email(user):
             'Welcome to Velttech Coding Academy.\n\n'
             'Your parent account has been approved. You can now log in to your parent portal, '
             'add or manage child records, and follow academy updates.\n\n'
-            'Login link: https://velttech.org/login\n\n'
+            f'Login link: {login_url}\n\n'
             'Contact:\n'
             'Email: info@velttech.org\n'
             'Phone: +233 55 510 6820\n\n'
@@ -434,6 +471,8 @@ def send_student_approval_email(student, payment=None):
     if not recipient_email:
         return False
 
+    login_url = f'{settings.FRONTEND_URL.rstrip("/")}/login'
+    payment_url = f'{settings.FRONTEND_URL.rstrip("/")}/payments'
     adult = is_adult_learner(student)
     recipient_name = str(student) if adult else str(student.parent)
     learner_name = str(student)
@@ -449,7 +488,7 @@ def send_student_approval_email(student, payment=None):
         f'{approval_line}\n\n'
         f'Approved course: {course_summary}\n\n'
         f'Course fee: {course_fee}\n'
-        'Login link: https://velttech.org/login\n\n'
+        f'Login link: {login_url}\n\n'
         f'Please log in to your {portal_label} to complete payment.\n'
     )
     if payment:
@@ -457,7 +496,7 @@ def send_student_approval_email(student, payment=None):
             f'Invoice amount: {format_invoice_amount(payment)}\n'
             'Payment status: Pending\n'
             'Click Pay Now in your dashboard to complete payment.\n'
-            'Payment portal: https://velttech.org/payments\n\n'
+            f'Payment portal: {payment_url}\n\n'
         )
     message += (
         'Contact:\n'
@@ -785,6 +824,9 @@ class DashboardView(APIView):
                 enrollment__student__user=user,
             ).select_related('enrollment__course')
             payments = visible_payments_for(user)
+            today = timezone.localdate()
+            current_period = current_payment_period(today)
+            current_period_payments = payments.filter(payment_current_period_query(current_period, today))
             payment_summary = payments.aggregate(
                 total=Count('id'),
                 completed=Count('id', filter=Q(status=Payment.STATUS_PAID)),
@@ -799,7 +841,7 @@ class DashboardView(APIView):
                 ),
             )
             pending_payment_ids = list(
-                payments.filter(status=Payment.STATUS_PENDING).values_list('id', flat=True)
+                current_period_payments.filter(status=Payment.STATUS_PENDING).values_list('id', flat=True)
             )
             assignments = Assignment.objects.filter(
                 is_active=True,
@@ -934,9 +976,13 @@ class DashboardView(APIView):
                         'pending': payment_summary['pending'] or 0,
                         'completed_amount': payment_summary['completed_amount'] or 0,
                         'outstanding_amount': payment_summary['outstanding_amount'] or 0,
-                        'current_payment_period': payments.order_by('-created_at').first().payment_period if payments.exists() else '',
-                        'current_amount_paid': payment_summary['completed_amount'] or 0,
-                        'outstanding_monthly_payment': payment_summary['outstanding_amount'] or 0,
+                        'current_payment_period': current_period,
+                        'current_amount_paid': current_period_payments.filter(
+                            status=Payment.STATUS_PAID,
+                        ).aggregate(total=Sum('amount'))['total'] or 0,
+                        'outstanding_monthly_payment': current_period_payments.filter(
+                            status=Payment.STATUS_PENDING,
+                        ).aggregate(total=Sum('amount'))['total'] or 0,
                         'pending_payment_ids': pending_payment_ids,
                     },
                     'recent_payments': DashboardPaymentSerializer(
@@ -1043,31 +1089,6 @@ def month_sequence(start_date, end_date):
             current = current.replace(month=current.month + 1)
 
 
-PAYMENT_PERIOD_MONTHS = [
-    '',
-    'January',
-    'February',
-    'March',
-    'April',
-    'May',
-    'June',
-    'July',
-    'August',
-    'September',
-    'October',
-    'November',
-    'December',
-]
-
-
-def payment_period_label(payment, year, month):
-    if payment and payment.payment_period:
-        return payment.payment_period
-    if month and year and 1 <= month <= 12:
-        return f'{PAYMENT_PERIOD_MONTHS[month]} {year}'
-    return str(year) if year else ''
-
-
 def payment_period_for_payment(payment):
     payment_day = payment.payment_date or (
         payment.paid_at.date() if payment.paid_at else payment.created_at.date()
@@ -1081,25 +1102,26 @@ def payment_period_for_payment(payment):
 
 def build_parent_payment_dashboard(children, payments):
     today = timezone.localdate()
-    current_pending = payments.filter(status=Payment.STATUS_PENDING)
+    current_period = current_payment_period(today)
+    current_period_filter = payment_current_period_query(current_period, today)
+    current_pending = payments.filter(current_period_filter, status=Payment.STATUS_PENDING)
+    current_paid = payments.filter(current_period_filter, status=Payment.STATUS_PAID)
     paid_payments = payments.filter(status=Payment.STATUS_PAID)
-    display_payment = current_pending.order_by('-created_at').first() or paid_payments.order_by('-paid_at', '-payment_date', '-created_at').first()
-    current_period = payment_period_for_payment(display_payment) if display_payment else payment_period_label(None, today.year, today.month)
     latest_payment = payments.filter(status=Payment.STATUS_PAID).order_by('-paid_at', '-payment_date', '-created_at').first()
 
     child_statuses = {}
     for child in children:
         child_pending = current_pending.filter(enrollment__student_id=child.id)
-        child_paid = paid_payments.filter(enrollment__student_id=child.id)
-        child_display_payment = child_pending.order_by('-created_at').first() or child_paid.order_by('-paid_at', '-payment_date', '-created_at').first()
+        child_paid = current_paid.filter(enrollment__student_id=child.id)
         child_statuses[child.id] = {
             'current_payment_status': (
                 'pending'
                 if child_pending.exists()
                 else ('paid' if child_paid.exists() else 'no outstanding payment')
             ),
-            'current_payment_period': payment_period_for_payment(child_display_payment) if child_display_payment else current_period,
+            'current_payment_period': current_period,
             'outstanding_amount': child_pending.aggregate(total=Sum('amount'))['total'] or Decimal('0.00'),
+            'amount_paid': child_paid.aggregate(total=Sum('amount'))['total'] or Decimal('0.00'),
             'pending_payment_ids': list(child_pending.values_list('id', flat=True)),
         }
 
@@ -1107,7 +1129,7 @@ def build_parent_payment_dashboard(children, payments):
         'current_payment_period': current_period,
         'current_pending_payment_ids': list(current_pending.values_list('id', flat=True)),
         'outstanding_monthly_payment': current_pending.aggregate(total=Sum('amount'))['total'] or Decimal('0.00'),
-        'current_amount_paid': latest_payment.amount if latest_payment else Decimal('0.00'),
+        'current_amount_paid': current_paid.aggregate(total=Sum('amount'))['total'] or Decimal('0.00'),
         'last_payment': {
             'amount': latest_payment.amount,
             'payment_period': payment_period_for_payment(latest_payment),

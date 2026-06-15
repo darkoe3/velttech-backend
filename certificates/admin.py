@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Certificate
+from .models import Certificate, CertificateBranding
 
 
 @admin.register(Certificate)
@@ -49,3 +49,12 @@ class CertificateAdmin(admin.ModelAdmin):
         if not change:  # New object
             obj.issued_by = request.user
         super().save_model(request, obj, form, change)
+
+
+@admin.register(CertificateBranding)
+class CertificateBrandingAdmin(admin.ModelAdmin):
+    fields = ('academy_logo', 'director_signature', 'updated_at')
+    readonly_fields = ('updated_at',)
+
+    def has_add_permission(self, request):
+        return not CertificateBranding.objects.exists()

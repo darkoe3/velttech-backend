@@ -73,6 +73,12 @@ class User(AbstractBaseUser, PermissionsMixin):
     )
     is_suspicious = models.BooleanField(default=False)
     suspicious_reason = models.TextField(blank=True)
+    instructor_signature = models.ImageField(
+        upload_to='instructors/signatures/',
+        blank=True,
+        null=True,
+        help_text='Optional signature image used on certificates for assigned learners.',
+    )
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
     date_joined = models.DateTimeField(auto_now_add=True)

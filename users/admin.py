@@ -12,7 +12,7 @@ class UserAdmin(BaseUserAdmin):
     search_fields = ('email', 'first_name', 'last_name')
     fieldsets = (
         (None, {'fields': ('email', 'password')}),
-        ('Personal info', {'fields': ('first_name', 'last_name', 'role', 'account_type')}),
+        ('Personal info', {'fields': ('first_name', 'last_name', 'role', 'account_type', 'instructor_signature')}),
         ('Approval', {'fields': ('approval_status', 'is_suspicious', 'suspicious_reason')}),
         ('Permissions', {'fields': ('is_active', 'is_staff', 'is_superuser', 'groups', 'user_permissions')}),
         ('Important dates', {'fields': ('last_login',)}),

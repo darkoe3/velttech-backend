@@ -1,4 +1,5 @@
 from django.db import models, transaction
+from django.db.models import Q
 from django.utils import timezone
 
 
@@ -66,6 +67,13 @@ class Payment(models.Model):
 
     class Meta:
         ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['enrollment', 'payment_period'],
+                condition=~Q(payment_period=''),
+                name='unique_payment_period_per_enrollment',
+            ),
+        ]
 
     def __str__(self):
         return f'{self.enrollment} - {self.amount}'

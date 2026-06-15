@@ -50,6 +50,7 @@ if any("://" in host for host in ALLOWED_HOSTS):
 CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS", [
     "https://velttech.org",
     "https://www.velttech.org",
+    "https://app.velttech.org",
     "http://localhost:3000",
 ])
 CORS_ALLOW_CREDENTIALS = True
@@ -58,6 +59,8 @@ CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS", [
     "https://velttech.org",
     "https://www.velttech.org",
     "https://api.velttech.org",
+    "https://app.velttech.org",
+     "https://veltsmartschoolapp.vercel.app",
 ])
 
 

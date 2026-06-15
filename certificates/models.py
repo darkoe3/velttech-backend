@@ -208,3 +208,30 @@ class Certificate(models.Model):
             self.save()
             return True
         return False
+
+
+class CertificateBranding(models.Model):
+    academy_logo = models.ImageField(
+        upload_to='certificates/branding/',
+        blank=True,
+        null=True,
+        help_text='Optional logo used on generated certificate PDFs.',
+    )
+    director_signature = models.ImageField(
+        upload_to='certificates/branding/',
+        blank=True,
+        null=True,
+        help_text='Optional Academy Director signature used on generated certificate PDFs.',
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Certificate branding'
+        verbose_name_plural = 'Certificate branding'
+
+    def __str__(self):
+        return 'Certificate branding'
+
+    @classmethod
+    def current(cls):
+        return cls.objects.order_by('pk').first()
