@@ -54,14 +54,10 @@ class CertificatePDFGenerator:
         dark = HexColor(DARK)
         gold = HexColor(GOLD)
         orange = HexColor(ORANGE)
+        green = HexColor(GREEN)
         tech_blue = HexColor(TECH_BLUE)
 
-        pdf.setStrokeColor(gold)
-        pdf.setLineWidth(5)
-        pdf.rect(0.35 * inch, 0.35 * inch, page_width - 0.7 * inch, page_height - 0.7 * inch)
-        pdf.setStrokeColor(orange)
-        pdf.setLineWidth(1.5)
-        pdf.rect(0.55 * inch, 0.55 * inch, page_width - 1.1 * inch, page_height - 1.1 * inch)
+        self._draw_double_border(pdf, page_width, page_height, gold)
 
         branding = CertificateBranding.current()
         logo_path = self._academy_logo_path(branding)
@@ -71,119 +67,108 @@ class CertificatePDFGenerator:
                 pdf,
                 logo_path,
                 (page_width - 1.75 * inch) / 2,
-                page_height - 1.28 * inch,
-                1.75 * inch,
-                0.68 * inch,
+                page_height - 1.12 * inch,
+                1.65 * inch,
+                0.58 * inch,
             )
         if not logo_drawn:
             pdf.setFillColor(dark)
             pdf.setFont('Helvetica-Bold', 16)
-            pdf.drawCentredString(page_width / 2, page_height - 0.92 * inch, 'VELTTECH')
+            pdf.drawCentredString(page_width / 2, page_height - 0.82 * inch, 'VELTTECH')
             pdf.setFont('Helvetica-Bold', 14)
-            pdf.drawCentredString(page_width / 2, page_height - 1.16 * inch, 'Young Innovators Academy')
+            pdf.drawCentredString(page_width / 2, page_height - 1.04 * inch, 'Young Innovators Academy')
 
         certificate_title = 'CERTIFICATE OF COMPLETION'
         pdf.setFillColor(gold)
-        pdf.setFont('Helvetica-Bold', 28)
-        pdf.drawCentredString(page_width / 2, page_height - 2.08 * inch, certificate_title)
+        pdf.setFont('Times-Bold', 31)
+        pdf.drawCentredString(page_width / 2, page_height - 1.78 * inch, certificate_title)
+        pdf.setStrokeColor(orange)
+        pdf.setLineWidth(0.8)
+        pdf.line(page_width / 2 - 1.75 * inch, page_height - 1.96 * inch, page_width / 2 + 1.75 * inch, page_height - 1.96 * inch)
 
         pdf.setFillColor(dark)
-        pdf.setFont('Helvetica', 13)
-        pdf.drawCentredString(page_width / 2, page_height - 2.42 * inch, 'This certificate is proudly presented to')
+        pdf.setFont('Helvetica', 12.5)
+        pdf.drawCentredString(page_width / 2, page_height - 2.3 * inch, 'This is to certify that')
+
+        pdf.setFont('Helvetica-Bold', 9.5)
+        pdf.drawCentredString(page_width / 2, page_height - 2.62 * inch, 'AWARDED TO')
 
         pdf.setFillColor(orange)
-        pdf.setFont('Helvetica-Bold', 28)
-        pdf.drawCentredString(page_width / 2, page_height - 2.88 * inch, self._get_student_name())
-
-        pdf.setFillColor(dark)
-        pdf.setFont('Helvetica', 13)
-        pdf.drawCentredString(page_width / 2, page_height - 3.22 * inch, 'Programme: Young Innovators Academy')
-        pdf.setFont('Helvetica-Bold', 16)
-        pdf.drawCentredString(
-            page_width / 2,
-            page_height - 3.54 * inch,
-            f'Specialization: {self.certificate.course.title}',
-        )
-
-        statement = (
-            f'This is to certify that {self._get_student_name()} has successfully completed '
-            f'the Young Innovators Academy programme with specialization in {self.certificate.course.title}, '
-            'offered by Velttech, '
-            'and has demonstrated dedication, creativity, and commitment throughout the learning journey.'
-        )
-        pdf.setFillColor(dark)
-        pdf.setFont('Helvetica', 10.5)
-        self._draw_wrapped_centred_text(
+        self._draw_fitted_centred_text(
             pdf,
-            statement,
+            self._get_student_name().upper(),
             page_width / 2,
-            page_height - 3.92 * inch,
-            7.8 * inch,
-            0.22 * inch,
+            page_height - 3.18 * inch,
+            8.2 * inch,
+            'Times-Bold',
+            38,
+            30,
         )
 
         issue_date = self.certificate.issue_date
         if not issue_date and self.certificate.issued_at:
             issue_date = self.certificate.issued_at.date()
+        completion_date = self.certificate.completion_date or issue_date
         verification_url = self.certificate.verification_url()
-        detail_rows = [
-            ('Programme', PROGRAMME_NAME),
-            ('Specialization', self.certificate.course.title),
-            ('Certificate Number', self.certificate.certificate_number),
-            ('Issue Date', issue_date.strftime('%B %d, %Y') if issue_date else 'Not recorded'),
-            ('Verification URL', verification_url),
-        ]
 
-        left_x = 1.25 * inch
-        start_y = page_height - 4.62 * inch
-        row_gap = 0.27 * inch
-        for index, (label, value) in enumerate(detail_rows):
-            x = left_x
-            y = start_y - index * row_gap
-            pdf.setFillColor(dark)
-            pdf.setFont('Helvetica-Bold', 10)
-            pdf.drawString(x, y, f'{label}:')
-            pdf.setFont('Helvetica', 10)
-            pdf.drawString(x + 1.15 * inch, y, str(value))
+        pdf.setFillColor(dark)
+        pdf.setFont('Helvetica', 12.5)
+        pdf.drawCentredString(page_width / 2, page_height - 3.76 * inch, 'has successfully completed the')
 
-        skills = self._skills()
-        if skills:
-            skills_x = 6.1 * inch
-            skills_y = page_height - 4.55 * inch
-            pdf.setFillColor(dark)
-            pdf.setFont('Helvetica-Bold', 10)
-            pdf.drawString(skills_x, skills_y, 'Skills Demonstrated')
-            pdf.setFont('Helvetica', 9)
-            for index, skill in enumerate(skills[:5]):
-                pdf.drawString(skills_x, skills_y - ((index + 1) * 0.24 * inch), f'- {skill}')
+        pdf.setFillColor(gold)
+        pdf.setFont('Times-Bold', 21)
+        pdf.drawCentredString(page_width / 2, page_height - 4.16 * inch, PROGRAMME_NAME)
+
+        detail_y = page_height - 4.76 * inch
+        pdf.setFillColor(dark)
+        pdf.setFont('Helvetica-Bold', 9.5)
+        pdf.drawCentredString(page_width / 2, detail_y, 'SPECIALIZATION')
+        pdf.setFillColor(dark)
+        self._draw_fitted_centred_text(
+            pdf,
+            self._display_specialization(),
+            page_width / 2,
+            detail_y - 0.31 * inch,
+            6.5 * inch,
+            'Helvetica-Bold',
+            16,
+            12,
+        )
+
+        pdf.setFillColor(dark)
+        pdf.setFont('Helvetica-Bold', 9.5)
+        pdf.drawCentredString(page_width / 2, detail_y - 0.86 * inch, 'AWARDED ON')
+        pdf.setFont('Helvetica', 13)
+        pdf.drawCentredString(
+            page_width / 2,
+            detail_y - 1.16 * inch,
+            completion_date.strftime('%d %B %Y') if completion_date else 'Not recorded',
+        )
 
         pdf.setFillColor(tech_blue)
         pdf.setFont('Helvetica-Oblique', 9)
-        pdf.drawCentredString(page_width / 2, 1.65 * inch, f'Verify online: {verification_url}')
+        pdf.drawCentredString(page_width / 2, 1.47 * inch, f'Verify online: {verification_url}')
 
         director_signature_path = self._file_field_path(getattr(branding, 'director_signature', None))
-        instructor_signature_path = self._instructor_signature_path()
         self._draw_signature_block(
             pdf,
             1.35 * inch,
-            1.12 * inch,
+            1.08 * inch,
             2.35 * inch,
             'Academy Director',
+            'Velttech Academy',
             director_signature_path,
             dark,
         )
-        self._draw_signature_block(
+
+        self._draw_certificate_metadata_block(
             pdf,
-            page_width - 3.55 * inch,
-            1.12 * inch,
-            2.15 * inch,
-            'Course Instructor',
-            instructor_signature_path,
+            page_width - 3.95 * inch,
+            1.1 * inch,
+            2.05 * inch,
             dark,
         )
-
-        pdf.setFont('Helvetica', 8)
-        pdf.drawCentredString(page_width / 2, 0.62 * inch, f'Verification Code: {self.certificate.verification_code}')
+        self._draw_academy_seal(pdf, page_width - 1.55 * inch, 2.03 * inch, 0.42 * inch, gold, orange, green, dark)
 
         # Add QR code to bottom-right corner
         try:
@@ -197,8 +182,8 @@ class CertificatePDFGenerator:
             
             # Place QR code in bottom-right corner
             qr_size = 0.9 * inch
-            qr_x = page_width - qr_size - 0.5 * inch
-            qr_y = 0.5 * inch
+            qr_x = page_width - qr_size - 0.7 * inch
+            qr_y = 0.58 * inch
             
             pdf.drawImage(
                 qr_path,
@@ -248,6 +233,27 @@ class CertificatePDFGenerator:
             return 'Not recorded'
         return f'{value}%'
 
+    def _display_specialization(self) -> str:
+        return self.certificate.course.title.replace(' and ', ' & ')
+
+    def _draw_double_border(self, pdf, page_width, page_height, color):
+        from reportlab.lib.units import inch
+
+        pdf.setStrokeColor(color)
+        pdf.setLineWidth(1.6)
+        pdf.rect(0.36 * inch, 0.36 * inch, page_width - 0.72 * inch, page_height - 0.72 * inch)
+        pdf.setLineWidth(0.7)
+        pdf.rect(0.53 * inch, 0.53 * inch, page_width - 1.06 * inch, page_height - 1.06 * inch)
+
+    def _draw_fitted_centred_text(self, pdf, text, center_x, baseline_y, max_width, font_name, max_size, min_size):
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+
+        font_size = max_size
+        while font_size > min_size and stringWidth(text, font_name, font_size) > max_width:
+            font_size -= 1
+        pdf.setFont(font_name, font_size)
+        pdf.drawCentredString(center_x, baseline_y, text)
+
     def _draw_wrapped_centred_text(self, pdf, text, center_x, start_y, max_width, line_height):
         from reportlab.pdfbase.pdfmetrics import stringWidth
 
@@ -276,10 +282,6 @@ class CertificatePDFGenerator:
         if public_logo.exists():
             return str(public_logo)
         return None
-
-    def _instructor_signature_path(self):
-        instructor = getattr(self.certificate.enrollment, 'instructor', None)
-        return self._file_field_path(getattr(instructor, 'instructor_signature', None))
 
     def _file_field_path(self, field_file):
         if not field_file:
@@ -312,7 +314,7 @@ class CertificatePDFGenerator:
         except Exception:
             return False
 
-    def _draw_signature_block(self, pdf, x, line_y, width, label, signature_path, color):
+    def _draw_signature_block(self, pdf, x, line_y, width, label, sublabel, signature_path, color):
         from reportlab.lib.units import inch
 
         if signature_path:
@@ -331,6 +333,41 @@ class CertificatePDFGenerator:
         pdf.setFillColor(color)
         pdf.setFont('Helvetica-Bold', 10)
         pdf.drawCentredString(x + width / 2, line_y - 0.22 * inch, label)
+        pdf.setFont('Helvetica', 8.5)
+        pdf.drawCentredString(x + width / 2, line_y - 0.42 * inch, sublabel)
+
+    def _draw_certificate_metadata_block(self, pdf, x, line_y, width, color):
+        from reportlab.lib.units import inch
+
+        center_x = x + width / 2
+        pdf.setFillColor(color)
+        pdf.setFont('Helvetica-Bold', 10)
+        pdf.drawCentredString(center_x, line_y + 0.52 * inch, 'Certificate No.')
+        pdf.setFont('Helvetica', 9)
+        pdf.drawCentredString(center_x, line_y + 0.31 * inch, self.certificate.certificate_number)
+        pdf.setFont('Helvetica-Bold', 10)
+        pdf.drawCentredString(center_x, line_y + 0.04 * inch, 'Verification Code')
+        pdf.setFont('Helvetica', 7.5)
+        pdf.drawCentredString(center_x, line_y - 0.17 * inch, str(self.certificate.verification_code))
+
+    def _draw_academy_seal(self, pdf, center_x, center_y, radius, gold, orange, green, dark):
+        from reportlab.lib.units import inch
+
+        pdf.setStrokeColor(gold)
+        pdf.setLineWidth(1.2)
+        pdf.circle(center_x, center_y, radius)
+        pdf.setStrokeColor(orange)
+        pdf.setLineWidth(0.8)
+        pdf.circle(center_x, center_y, radius - 0.08 * inch)
+        pdf.setStrokeColor(green)
+        pdf.setLineWidth(0.8)
+        pdf.circle(center_x, center_y, radius - 0.18 * inch)
+        pdf.setFillColor(dark)
+        pdf.setFont('Helvetica-Bold', 6.6)
+        pdf.drawCentredString(center_x, center_y + 0.1 * inch, 'VELTTECH ACADEMY')
+        pdf.setFillColor(orange)
+        pdf.setFont('Helvetica-Bold', 8.2)
+        pdf.drawCentredString(center_x, center_y - 0.1 * inch, 'CERTIFIED')
 
     def _skills(self):
         if self.certificate.skills_covered:

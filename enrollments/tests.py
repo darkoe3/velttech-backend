@@ -341,6 +341,66 @@ class InstructorGradingTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_student_assignment_payload_includes_answerable_questions_without_answers(self):
+        assignment = Assignment.objects.create(
+            title='Visible Quiz',
+            description='Answer all visible questions.',
+            course=self.course,
+            instructor=self.instructor,
+            due_date='2026-08-02',
+            submission_type=Assignment.ASSESSMENT_QUIZ,
+            marks=10,
+        )
+        question = AssignmentQuestion.objects.create(
+            assignment=assignment,
+            question_text='Pick A.',
+            option_a='A',
+            option_b='B',
+            option_c='C',
+            option_d='D',
+            correct_answer='A',
+            marks=10,
+        )
+        self.client.force_authenticate(self.student_user)
+
+        response = self.client.get(reverse('my_assignments'))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        payload = next(item for item in response.data if item['id'] == assignment.id)
+        self.assertEqual(payload['questions'][0]['id'], question.id)
+        self.assertNotIn('correct_answer', payload['questions'][0])
+        self.assertIsNone(payload['submission'])
+
+    def test_parent_cannot_submit_child_quiz(self):
+        assignment = Assignment.objects.create(
+            title='Child Quiz',
+            description='Parent must not submit.',
+            course=self.course,
+            instructor=self.instructor,
+            due_date='2026-08-02',
+            submission_type=Assignment.ASSESSMENT_QUIZ,
+            marks=10,
+        )
+        question = AssignmentQuestion.objects.create(
+            assignment=assignment,
+            question_text='Pick A.',
+            option_a='A',
+            option_b='B',
+            option_c='C',
+            option_d='D',
+            correct_answer='A',
+            marks=10,
+        )
+        self.client.force_authenticate(self.parent_user)
+
+        response = self.client.post(
+            self.submit_url(assignment),
+            {'answers': {str(question.id): 'A'}},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
     def test_student_cannot_submit_practical_assessment(self):
         assignment = Assignment.objects.create(
             title='Practical Task',
@@ -393,6 +453,31 @@ class InstructorGradingTests(APITestCase):
         submission = AssignmentSubmission.objects.get(assignment=assignment, student=self.student)
         self.assertEqual(submission.status, AssignmentSubmission.STATUS_GRADED)
         self.assertEqual(submission.graded_by, self.instructor)
+
+    def test_instructor_submission_list_can_filter_by_assignment(self):
+        other_assignment = Assignment.objects.create(
+            title='Other Result',
+            description='Different assessment.',
+            course=self.course,
+            instructor=self.instructor,
+            due_date='2026-08-04',
+            submission_type=Assignment.ASSESSMENT_PRACTICAL,
+            marks=30,
+        )
+        AssignmentSubmission.objects.create(
+            assignment=other_assignment,
+            student=self.student,
+            status=AssignmentSubmission.STATUS_GRADED,
+            max_score=30,
+            score=20,
+        )
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.get(reverse('instructor-submissions'), {'assignment': self.assignment.id})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['assignment'], self.assignment.id)
 
     def test_instructor_cannot_grade_practical_above_max_score(self):
         assignment = Assignment.objects.create(

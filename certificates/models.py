@@ -97,6 +97,7 @@ class Certificate(models.Model):
         blank=True,
         null=True,
     )
+    certificate_email_sent_at = models.DateTimeField(blank=True, null=True)
     revoked_at = models.DateTimeField(blank=True, null=True)
     revoke_reason = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

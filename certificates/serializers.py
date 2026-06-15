@@ -99,6 +99,7 @@ class CertificateSerializer(serializers.ModelSerializer):
             'qr_code',
             'pdf_file',
             'certificate_file',
+            'certificate_email_sent_at',
             'revoked_at',
             'created_at',
             'updated_at',
@@ -112,6 +113,7 @@ class CertificateSerializer(serializers.ModelSerializer):
             'qr_code',
             'pdf_file',
             'certificate_file',
+            'certificate_email_sent_at',
             'created_at',
             'updated_at',
         ]

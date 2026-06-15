@@ -145,6 +145,9 @@ class CertificateViewSet(viewsets.ModelViewSet):
             certificate,
             f'{certificate.certificate_number} issued to {certificate.student} for {certificate.course}.',
         )
+        from .notifications import send_certificate_issued_notification
+
+        send_certificate_issued_notification(certificate)
 
         return Response(
             CertificateSerializer(certificate).data,
@@ -250,6 +253,7 @@ class CertificateViewSet(viewsets.ModelViewSet):
         certificate.save()
 
         from .pdf_generator import CertificatePDFGenerator
+        from .notifications import send_certificate_issued_notification
 
         CertificatePDFGenerator(certificate).save_to_certificate()
         log_certificate_activity(
@@ -258,6 +262,7 @@ class CertificateViewSet(viewsets.ModelViewSet):
             certificate,
             f'{certificate.certificate_number} was reissued.',
         )
+        send_certificate_issued_notification(certificate, force=True)
         return Response(CertificateSerializer(certificate).data, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated], url_path='export')

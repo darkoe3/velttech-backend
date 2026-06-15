@@ -881,6 +881,7 @@ class DashboardView(APIView):
             assignment_items = []
             for assignment in student_assignments:
                 submission = next(iter(getattr(assignment, 'student_submissions', [])), None)
+                assignment_status = submission.status if submission else 'not_started'
                 assignment_items.append(
                     {
                         'id': assignment.id,
@@ -889,7 +890,7 @@ class DashboardView(APIView):
                         'due_date': assignment.due_date,
                         'submission_type': assignment.submission_type,
                         'marks': assignment.marks,
-                        'status': submission.status if submission else AssignmentSubmission.STATUS_PENDING,
+                        'status': assignment_status,
                     }
                 )
             return Response(

@@ -1,6 +1,7 @@
 from django.test import TestCase, override_settings
 from django.contrib.auth import get_user_model
 from django.core.files.base import ContentFile
+from django.core import mail
 from django.urls import reverse
 from django.utils import timezone
 from datetime import date
@@ -13,6 +14,7 @@ from students.models import Student, Parent
 from enrollments.models import Assignment, AssignmentSubmission, Attendance, Enrollment
 from payments.models import Payment
 from users.models import ActivityLog
+from notifications.models import Notification
 from .models import Certificate
 
 User = get_user_model()
@@ -213,7 +215,11 @@ class CertificateModelTests(TestCase):
         self.assertGreater(len(pdf_bytes), 1000)
 
 
-@override_settings(MIDDLEWARE=[])
+@override_settings(
+    MIDDLEWARE=[],
+    EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend',
+    FRONTEND_URL='https://academy.test',
+)
 class CertificateAPITests(CertificateModelTests):
     def setUp(self):
         super().setUp()
@@ -239,6 +245,120 @@ class CertificateAPITests(CertificateModelTests):
         self.assertEqual(response.data['final_grade'], 'A')
         self.assertEqual(Certificate.objects.count(), 1)
         self.assertTrue(ActivityLog.objects.filter(action='Certificate issued').exists())
+        certificate = Certificate.objects.get()
+        certificate.refresh_from_db()
+        self.assertIsNotNone(certificate.certificate_email_sent_at)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(
+            mail.outbox[0].subject,
+            'Congratulations! Student User has completed Young Innovators Academy',
+        )
+        self.assertEqual(mail.outbox[0].to, [self.parent.email])
+        self.assertEqual(mail.outbox[0].attachments, [])
+        self.assertIn('parent portal', mail.outbox[0].body)
+        self.assertIn('https://academy.test/login', mail.outbox[0].body)
+        self.assertTrue(Notification.objects.filter(
+            recipient=self.parent_user,
+            title='Certificate Issued',
+            message='A certificate has been issued for Student User.',
+        ).exists())
+
+    @patch('certificates.pdf_generator.CertificatePDFGenerator')
+    def test_adult_learner_receives_certificate_notification(self, generator_cls):
+        generator_cls.return_value.save_to_certificate.return_value = None
+        adult_user = User.objects.create_user(
+            email='adult@test.com',
+            password='testpass123',
+            first_name='Adult',
+            last_name='Learner',
+            role='student',
+            account_type='adult_learner',
+            approval_status='approved',
+        )
+        adult_student = Student.objects.create(
+            user=adult_user,
+            first_name='Adult',
+            last_name='Learner',
+            email='adult-profile@test.com',
+            learner_type=Student.LEARNER_ADULT,
+            approval_status='approved',
+        )
+        adult_enrollment = Enrollment.objects.create(
+            student=adult_student,
+            course=self.course,
+            instructor=self.instructor,
+            status='completed',
+        )
+        Payment.objects.create(
+            enrollment=adult_enrollment,
+            amount=300.00,
+            status='paid',
+        )
+        self.client.force_authenticate(self.admin_user)
+
+        response = self.client.post(reverse('certificate-issue'), {
+            'enrollment_id': adult_enrollment.id,
+            'completion_date': date.today().isoformat(),
+        }, format='json')
+
+        self.assertEqual(response.status_code, 201)
+        certificate = Certificate.objects.get(enrollment=adult_enrollment)
+        self.assertIsNotNone(certificate.certificate_email_sent_at)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].subject, 'Your Velttech Academy Certificate Is Ready')
+        self.assertEqual(mail.outbox[0].to, [adult_user.email])
+        self.assertEqual(mail.outbox[0].attachments, [])
+        self.assertIn('student dashboard', mail.outbox[0].body)
+        self.assertTrue(Notification.objects.filter(
+            recipient=adult_user,
+            title='Certificate Ready',
+            message='Your certificate for Young Innovators Academy is now available.',
+        ).exists())
+
+    @patch('certificates.pdf_generator.CertificatePDFGenerator')
+    def test_certificate_notification_is_not_duplicated(self, generator_cls):
+        from .notifications import send_certificate_issued_notification
+
+        generator_cls.return_value.save_to_certificate.return_value = None
+        self.client.force_authenticate(self.admin_user)
+
+        response = self.client.post(reverse('certificate-issue'), {
+            'enrollment_id': self.enrollment.id,
+            'completion_date': date.today().isoformat(),
+        }, format='json')
+
+        self.assertEqual(response.status_code, 201)
+        certificate = Certificate.objects.get()
+        first_sent_at = certificate.certificate_email_sent_at
+        certificate.completion_date = date.today()
+        certificate.save()
+        sent_again = send_certificate_issued_notification(certificate)
+        certificate.refresh_from_db()
+
+        self.assertFalse(sent_again)
+        self.assertEqual(certificate.certificate_email_sent_at, first_sent_at)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(Notification.objects.filter(recipient=self.parent_user).count(), 1)
+
+    @patch('certificates.notifications.logger')
+    @patch('certificates.notifications.send_mail')
+    @patch('certificates.pdf_generator.CertificatePDFGenerator')
+    def test_certificate_issuance_succeeds_when_notification_email_fails(self, generator_cls, send_mail_mock, logger_mock):
+        generator_cls.return_value.save_to_certificate.return_value = None
+        send_mail_mock.side_effect = RuntimeError('SMTP unavailable')
+        self.client.force_authenticate(self.admin_user)
+
+        response = self.client.post(reverse('certificate-issue'), {
+            'enrollment_id': self.enrollment.id,
+            'completion_date': date.today().isoformat(),
+        }, format='json')
+
+        self.assertEqual(response.status_code, 201)
+        certificate = Certificate.objects.get()
+        self.assertIsNone(certificate.certificate_email_sent_at)
+        self.assertTrue(Notification.objects.filter(recipient=self.parent_user).exists())
+        self.assertTrue(ActivityLog.objects.filter(action='certificate_email_failed').exists())
+        logger_mock.exception.assert_called_once()
 
     @patch('certificates.pdf_generator.CertificatePDFGenerator')
     def test_instructor_can_only_issue_assigned_certificate(self, generator_cls):
