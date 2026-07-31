@@ -189,6 +189,167 @@ class AdminInstructorPortalAccessTests(APITestCase):
         self.assertEqual(progress_response.status_code, status.HTTP_201_CREATED)
 
 
+@override_settings(SECURE_SSL_REDIRECT=False)
+class InstructorDashboardAttendanceSummaryTests(APITestCase):
+    def setUp(self):
+        self.instructor = User.objects.create_user(
+            email='dashboard-instructor@example.com',
+            password='pass',
+            role=User.ROLE_INSTRUCTOR,
+            approval_status=User.APPROVAL_APPROVED,
+        )
+        self.other_instructor = User.objects.create_user(
+            email='other-dashboard-instructor@example.com',
+            password='pass',
+            role=User.ROLE_INSTRUCTOR,
+            approval_status=User.APPROVAL_APPROVED,
+        )
+        self.empty_instructor = User.objects.create_user(
+            email='empty-dashboard-instructor@example.com',
+            password='pass',
+            role=User.ROLE_INSTRUCTOR,
+            approval_status=User.APPROVAL_APPROVED,
+        )
+        self.course = Course.objects.create(
+            title='Dashboard Python',
+            description='Dashboard course',
+            duration_months=3,
+            monthly_fee=100,
+            fee=300,
+        )
+        self.other_course = Course.objects.create(
+            title='Dashboard JavaScript',
+            description='Other dashboard course',
+            duration_months=3,
+            monthly_fee=100,
+            fee=300,
+        )
+        self.student = Student.objects.create(
+            first_name='Assigned',
+            last_name='Learner',
+            email='assigned-learner@example.com',
+            approval_status=Student.STATUS_APPROVED,
+        )
+        self.other_student = Student.objects.create(
+            first_name='Other',
+            last_name='Learner',
+            email='other-learner@example.com',
+            approval_status=Student.STATUS_APPROVED,
+        )
+        self.empty_student = Student.objects.create(
+            first_name='Empty',
+            last_name='Learner',
+            email='empty-learner@example.com',
+            approval_status=Student.STATUS_APPROVED,
+        )
+        self.enrollment = Enrollment.objects.create(
+            student=self.student,
+            course=self.course,
+            instructor=self.instructor,
+            status=Enrollment.STATUS_ACTIVE,
+        )
+        self.other_enrollment = Enrollment.objects.create(
+            student=self.other_student,
+            course=self.course,
+            instructor=self.other_instructor,
+            status=Enrollment.STATUS_ACTIVE,
+        )
+        Enrollment.objects.create(
+            student=self.empty_student,
+            course=self.other_course,
+            instructor=self.empty_instructor,
+            status=Enrollment.STATUS_ACTIVE,
+        )
+
+    def test_attendance_summary_is_scoped_and_counts_statuses(self):
+        statuses = [
+            Attendance.STATUS_PRESENT,
+            Attendance.STATUS_LATE,
+            Attendance.STATUS_ABSENT,
+            Attendance.STATUS_EXCUSED,
+            Attendance.STATUS_PRESENT,
+            Attendance.STATUS_ABSENT,
+            Attendance.STATUS_LATE,
+        ]
+        for index, attendance_status in enumerate(statuses, start=1):
+            Attendance.objects.create(
+                enrollment=self.enrollment,
+                date=f'2026-07-{index:02d}',
+                status=attendance_status,
+                remarks=f'Scoped attendance {index}',
+                recorded_by=self.instructor,
+            )
+        Attendance.objects.create(
+            enrollment=self.other_enrollment,
+            date='2026-07-08',
+            status=Attendance.STATUS_ABSENT,
+            remarks='Other instructor attendance',
+            recorded_by=self.other_instructor,
+        )
+
+        self.client.force_authenticate(self.instructor)
+        response = self.client.get(reverse('instructor-dashboard'))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data['attendance_summary'],
+            {
+                'total': 7,
+                'present': 2,
+                'absent': 2,
+                'late': 2,
+                'excused': 1,
+                'classes_attended': 4,
+                'percentage': 57,
+            },
+        )
+        self.assertEqual(len(response.data['recent_attendance']), 5)
+        self.assertEqual(
+            [record['date'] for record in response.data['recent_attendance']],
+            [
+                '2026-07-07',
+                '2026-07-06',
+                '2026-07-05',
+                '2026-07-04',
+                '2026-07-03',
+            ],
+        )
+        self.assertEqual(
+            response.data['recent_attendance'][0],
+            {
+                'id': response.data['recent_attendance'][0]['id'],
+                'student_name': 'Assigned Learner',
+                'course_title': 'Dashboard Python',
+                'date': '2026-07-07',
+                'status': Attendance.STATUS_LATE,
+                'remarks': 'Scoped attendance 7',
+            },
+        )
+        self.assertNotIn(
+            'Other Learner',
+            [record['student_name'] for record in response.data['recent_attendance']],
+        )
+
+    def test_attendance_summary_handles_zero_records(self):
+        self.client.force_authenticate(self.empty_instructor)
+        response = self.client.get(reverse('instructor-dashboard'))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data['attendance_summary'],
+            {
+                'total': 0,
+                'present': 0,
+                'absent': 0,
+                'late': 0,
+                'excused': 0,
+                'classes_attended': 0,
+                'percentage': 0,
+            },
+        )
+        self.assertEqual(response.data['recent_attendance'], [])
+
+
 @override_settings(
     EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend',
     SECURE_SSL_REDIRECT=False,

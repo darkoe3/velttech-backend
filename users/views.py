@@ -1532,6 +1532,44 @@ class InstructorDashboardView(APIView):
         active_enrollments = enrollments.filter(status=Enrollment.STATUS_ACTIVE).count()
         recent_enrollments = enrollments.order_by('-created_at')[:5]
         notifications = visible_notifications_for(request.user)[:5]
+        attendance = Attendance.objects.filter(
+            enrollment__in=enrollments,
+        ).select_related(
+            'enrollment__student',
+            'enrollment__course',
+        )
+        attendance_counts = attendance.aggregate(
+            total=Count('id'),
+            present=Count('id', filter=Q(status=Attendance.STATUS_PRESENT)),
+            absent=Count('id', filter=Q(status=Attendance.STATUS_ABSENT)),
+            late=Count('id', filter=Q(status=Attendance.STATUS_LATE)),
+            excused=Count('id', filter=Q(status=Attendance.STATUS_EXCUSED)),
+            classes_attended=Count(
+                'id',
+                filter=Q(
+                    status__in=[
+                        Attendance.STATUS_PRESENT,
+                        Attendance.STATUS_LATE,
+                    ]
+                ),
+            ),
+        )
+        total_attendance = attendance_counts['total'] or 0
+        classes_attended = attendance_counts['classes_attended'] or 0
+        attendance_percentage = round(
+            (classes_attended / total_attendance) * 100
+        ) if total_attendance else 0
+        recent_attendance = [
+            {
+                'id': record.id,
+                'student_name': str(record.enrollment.student),
+                'course_title': record.enrollment.course.title,
+                'date': record.date.isoformat(),
+                'status': record.status,
+                'remarks': record.remarks,
+            }
+            for record in attendance.order_by('-date', '-created_at')[:5]
+        ]
 
         return Response(
             {
@@ -1546,6 +1584,16 @@ class InstructorDashboardView(APIView):
                     notifications,
                     many=True,
                 ).data,
+                'attendance_summary': {
+                    'total': total_attendance,
+                    'present': attendance_counts['present'] or 0,
+                    'absent': attendance_counts['absent'] or 0,
+                    'late': attendance_counts['late'] or 0,
+                    'excused': attendance_counts['excused'] or 0,
+                    'classes_attended': classes_attended,
+                    'percentage': attendance_percentage,
+                },
+                'recent_attendance': recent_attendance,
             }
         )
 
