@@ -1,4 +1,5 @@
 import csv
+import logging
 
 from rest_framework import viewsets, status, generics
 from rest_framework.decorators import action
@@ -24,6 +25,10 @@ from .permissions import (
 )
 
 
+logger = logging.getLogger(__name__)
+CERTIFICATE_PDF_ERROR = 'The certificate PDF could not be prepared. Please contact Velttech support.'
+
+
 def _client_ip(request):
     forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
     if forwarded_for:
@@ -40,6 +45,27 @@ def log_certificate_activity(request, action, certificate, description):
         ip_address=_client_ip(request),
         role=getattr(user, 'role', '') if user else '',
     )
+
+
+def certificate_file_exists(file_field):
+    return bool(file_field and file_field.name and file_field.storage.exists(file_field.name))
+
+
+def prepare_certificate_pdf(certificate):
+    pdf_file = certificate.get_pdf_file()
+    if certificate_file_exists(pdf_file):
+        return pdf_file
+
+    from .pdf_generator import CertificatePDFGenerator
+
+    CertificatePDFGenerator(certificate).save_to_certificate()
+    certificate.refresh_from_db()
+    pdf_file = certificate.get_pdf_file()
+
+    if not certificate_file_exists(pdf_file):
+        raise FileNotFoundError('Certificate PDF regeneration did not create a readable file.')
+
+    return pdf_file
 
 
 class CertificateViewSet(viewsets.ModelViewSet):
@@ -159,11 +185,30 @@ class CertificateViewSet(viewsets.ModelViewSet):
         """Download certificate PDF"""
         certificate = self.get_object()
 
-        pdf_file = certificate.get_pdf_file()
-        if not pdf_file:
+        try:
+            pdf_file = prepare_certificate_pdf(certificate)
+            pdf_handle = pdf_file.open('rb')
+        except FileNotFoundError:
+            try:
+                from .pdf_generator import CertificatePDFGenerator
+
+                CertificatePDFGenerator(certificate).save_to_certificate()
+                certificate.refresh_from_db()
+                pdf_file = certificate.get_pdf_file()
+                if not certificate_file_exists(pdf_file):
+                    raise FileNotFoundError('Certificate PDF regeneration did not create a readable file.')
+                pdf_handle = pdf_file.open('rb')
+            except Exception:
+                logger.exception('Could not prepare certificate PDF for certificate %s.', certificate.pk)
+                return Response(
+                    {'detail': CERTIFICATE_PDF_ERROR},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+        except Exception:
+            logger.exception('Could not prepare certificate PDF for certificate %s.', certificate.pk)
             return Response(
-                {'error': 'Certificate file not available'},
-                status=status.HTTP_404_NOT_FOUND
+                {'detail': CERTIFICATE_PDF_ERROR},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
         log_certificate_activity(
@@ -174,7 +219,7 @@ class CertificateViewSet(viewsets.ModelViewSet):
         )
 
         return FileResponse(
-            pdf_file.open('rb'),
+            pdf_handle,
             as_attachment=True,
             filename=f"{certificate.certificate_number}.pdf"
         )

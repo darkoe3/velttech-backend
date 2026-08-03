@@ -394,6 +394,12 @@ class CertificateAPITests(CertificateModelTests):
         response = self.client.get(reverse('certificate-download', args=[cert.id]))
 
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'application/pdf')
+        self.assertEqual(
+            response['Content-Disposition'],
+            f'attachment; filename="{cert.certificate_number}.pdf"',
+        )
+        self.assertTrue(self._response_bytes(response).startswith(b'%PDF'))
         self.assertTrue(ActivityLog.objects.filter(action='Certificate downloaded').exists())
 
     def test_parent_downloads_child_certificate(self):
@@ -403,6 +409,99 @@ class CertificateAPITests(CertificateModelTests):
         response = self.client.get(reverse('certificate-download', args=[cert.id]))
 
         self.assertEqual(response.status_code, 200)
+
+    @patch('certificates.pdf_generator.CertificatePDFGenerator')
+    def test_download_regenerates_missing_pdf_file(self, generator_cls):
+        cert = self._create_certificate_with_file()
+        missing_name = cert.certificate_file.name
+        cert.certificate_file.storage.delete(missing_name)
+        self.assertFalse(cert.certificate_file.storage.exists(missing_name))
+
+        def save_regenerated_pdf():
+            cert.refresh_from_db()
+            cert.pdf_file.save(
+                f'{cert.certificate_number}.pdf',
+                ContentFile(b'%PDF-1.4 regenerated certificate'),
+                save=True,
+            )
+
+        generator_cls.return_value.save_to_certificate.side_effect = save_regenerated_pdf
+        self.client.force_authenticate(self.student_user)
+
+        response = self.client.get(reverse('certificate-download', args=[cert.id]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'application/pdf')
+        self.assertTrue(self._response_bytes(response).startswith(b'%PDF'))
+        generator_cls.assert_called_once()
+        cert.refresh_from_db()
+        self.assertTrue(cert.pdf_file.storage.exists(cert.pdf_file.name))
+
+    @patch('certificates.pdf_generator.CertificatePDFGenerator')
+    def test_download_generates_pdf_when_no_file_field_is_set(self, generator_cls):
+        cert = Certificate.objects.create(
+            student=self.student,
+            enrollment=self.enrollment,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_ISSUED,
+            issued_by=self.admin_user,
+        )
+
+        def save_generated_pdf():
+            cert.refresh_from_db()
+            cert.pdf_file.save(
+                f'{cert.certificate_number}.pdf',
+                ContentFile(b'%PDF-1.4 generated certificate'),
+                save=True,
+            )
+
+        generator_cls.return_value.save_to_certificate.side_effect = save_generated_pdf
+        self.client.force_authenticate(self.student_user)
+
+        response = self.client.get(reverse('certificate-download', args=[cert.id]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self._response_bytes(response).startswith(b'%PDF'))
+        generator_cls.assert_called_once()
+        cert.refresh_from_db()
+        self.assertTrue(cert.pdf_file.storage.exists(cert.pdf_file.name))
+
+    @patch('certificates.views.logger')
+    @patch('certificates.pdf_generator.CertificatePDFGenerator')
+    def test_download_regeneration_failure_returns_clean_error(self, generator_cls, logger_mock):
+        cert = self._create_certificate_with_file()
+        missing_name = cert.certificate_file.name
+        cert.certificate_file.storage.delete(missing_name)
+        generator_cls.return_value.save_to_certificate.side_effect = RuntimeError('PDF generator failed')
+        self.client.force_authenticate(self.student_user)
+
+        response = self.client.get(reverse('certificate-download', args=[cert.id]))
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            response.data['detail'],
+            'The certificate PDF could not be prepared. Please contact Velttech support.',
+        )
+        self.assertNotIn('PDF generator failed', str(response.data))
+        self.assertNotIn('traceback', str(response.data).lower())
+        logger_mock.exception.assert_called_once()
+
+    def test_instructor_downloads_assigned_certificate(self):
+        cert = self._create_certificate_with_file()
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.get(reverse('certificate-download', args=[cert.id]))
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_instructor_cannot_download_unassigned_certificate(self):
+        cert = self._create_other_student_certificate_with_file()
+        self.client.force_authenticate(self.other_instructor)
+
+        response = self.client.get(reverse('certificate-download', args=[cert.id]))
+
+        self.assertEqual(response.status_code, 404)
 
     def test_student_cannot_download_another_students_certificate(self):
         cert = self._create_other_student_certificate_with_file()
@@ -505,6 +604,11 @@ class CertificateAPITests(CertificateModelTests):
         self.assertEqual(response.data['final_score'], '85.00')
         self.assertEqual(response.data['final_grade'], 'A')
         self.assertEqual(response.data['attendance_percentage'], '50.00')
+
+    def _response_bytes(self, response):
+        if getattr(response, 'streaming', False):
+            return b''.join(response.streaming_content)
+        return response.content
 
     def _create_certificate_with_file(self):
         cert = Certificate.objects.create(
