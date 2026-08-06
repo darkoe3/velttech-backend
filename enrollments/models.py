@@ -1,4 +1,10 @@
+import uuid
+from decimal import Decimal
+
+from django.core.exceptions import ValidationError
+from django.core.validators import MinValueValidator
 from django.db import models
+from django.utils import timezone
 
 
 class Enrollment(models.Model):
@@ -149,6 +155,190 @@ class ProgressReport(models.Model):
         return f'{self.enrollment} - {self.progress_score}%'
 
 
+class AssessmentResult(models.Model):
+    STATUS_INCOMPLETE = 'incomplete'
+    STATUS_READY_FOR_REVIEW = 'ready_for_review'
+    STATUS_APPROVED = 'approved'
+    STATUS_BELOW_PASS_MARK = 'below_pass_mark'
+    STATUS_CERTIFICATE_ISSUED = 'certificate_issued'
+
+    STATUS_CHOICES = [
+        (STATUS_INCOMPLETE, 'Incomplete'),
+        (STATUS_READY_FOR_REVIEW, 'Ready for review'),
+        (STATUS_APPROVED, 'Approved'),
+        (STATUS_BELOW_PASS_MARK, 'Below pass mark'),
+        (STATUS_CERTIFICATE_ISSUED, 'Certificate issued'),
+    ]
+
+    enrollment = models.OneToOneField(
+        Enrollment,
+        on_delete=models.CASCADE,
+        related_name='assessment_result',
+    )
+    practical_max_score = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=40,
+        validators=[MinValueValidator(Decimal('0.01'))],
+    )
+    practical_score = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        blank=True,
+        null=True,
+        validators=[MinValueValidator(Decimal('0'))],
+    )
+    final_project_max_score = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=40,
+        validators=[MinValueValidator(Decimal('0.01'))],
+    )
+    final_project_score = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        blank=True,
+        null=True,
+        validators=[MinValueValidator(Decimal('0'))],
+    )
+    objective_quiz_max_score = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=20,
+        validators=[MinValueValidator(Decimal('0.01'))],
+    )
+    objective_quiz_score = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        blank=True,
+        null=True,
+        validators=[MinValueValidator(Decimal('0'))],
+    )
+    final_project_feedback = models.TextField(blank=True)
+    overall_score = models.DecimalField(max_digits=6, decimal_places=2, default=0)
+    total_max_score = models.DecimalField(max_digits=6, decimal_places=2, default=100)
+    percentage = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    status = models.CharField(
+        max_length=30,
+        choices=STATUS_CHOICES,
+        default=STATUS_INCOMPLETE,
+    )
+    is_approved = models.BooleanField(default=False)
+    approved_by = models.ForeignKey(
+        'users.User',
+        on_delete=models.SET_NULL,
+        related_name='approved_assessment_results',
+        blank=True,
+        null=True,
+    )
+    approved_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at', '-created_at']
+
+    def __str__(self):
+        return f'{self.enrollment} assessment result'
+
+    @property
+    def is_complete(self):
+        return all(
+            score is not None
+            for score in [
+                self.practical_score,
+                self.final_project_score,
+                self.objective_quiz_score,
+            ]
+        )
+
+    @property
+    def meets_pass_mark(self):
+        return self.is_complete and self.percentage >= self.enrollment.course.certificate_pass_mark
+
+    def clean(self):
+        super().clean()
+        score_pairs = [
+            ('practical_score', 'practical_max_score', 'Practical score'),
+            ('final_project_score', 'final_project_max_score', 'Final project score'),
+            ('objective_quiz_score', 'objective_quiz_max_score', 'Objective quiz score'),
+        ]
+        for score_field, max_field, label in score_pairs:
+            score = getattr(self, score_field)
+            max_score = getattr(self, max_field)
+            if score is not None and score > max_score:
+                raise ValidationError({score_field: f'{label} cannot exceed its maximum score.'})
+
+        if self.is_approved and not self.is_complete:
+            raise ValidationError({'is_approved': 'Only complete assessment results can be approved.'})
+
+    def recalculate(self):
+        self.total_max_score = (
+            self.practical_max_score
+            + self.final_project_max_score
+            + self.objective_quiz_max_score
+        )
+        self.overall_score = sum(
+            score or Decimal('0')
+            for score in [
+                self.practical_score,
+                self.final_project_score,
+                self.objective_quiz_score,
+            ]
+        )
+        self.percentage = Decimal('0.00')
+        if self.total_max_score:
+            self.percentage = (
+                (self.overall_score / self.total_max_score) * Decimal('100')
+            ).quantize(Decimal('0.01'))
+
+        if not self.is_complete:
+            self.status = self.STATUS_INCOMPLETE
+        elif self.percentage < self.enrollment.course.certificate_pass_mark:
+            self.status = self.STATUS_BELOW_PASS_MARK
+        elif self.is_approved:
+            self.status = self.STATUS_APPROVED
+        else:
+            self.status = self.STATUS_READY_FOR_REVIEW
+
+    def approve(self, user):
+        self.recalculate()
+        if not self.is_complete:
+            raise ValidationError('All score components are required before approval.')
+        if self.percentage < self.enrollment.course.certificate_pass_mark:
+            raise ValidationError('Assessment result is below the course certificate pass mark.')
+        self.is_approved = True
+        self.approved_by = user
+        self.approved_at = timezone.now()
+        self.recalculate()
+        self.save()
+
+    def import_objective_quiz_submission(self, submission):
+        if submission.student_id != self.enrollment.student_id:
+            raise ValidationError('Quiz submission does not belong to this learner.')
+        if submission.assignment.course_id != self.enrollment.course_id:
+            raise ValidationError('Quiz submission does not belong to this course.')
+        if submission.assignment.submission_type != Assignment.ASSESSMENT_QUIZ:
+            raise ValidationError('Only quiz assessment submissions can be imported.')
+        if submission.status != AssignmentSubmission.STATUS_GRADED or submission.score is None:
+            raise ValidationError('Only graded quiz submissions with a score can be imported.')
+
+        source_max = Decimal(submission.max_score or submission.assignment.marks or 0)
+        if source_max <= 0:
+            raise ValidationError('Quiz submission maximum score must be greater than zero.')
+
+        self.objective_quiz_score = (
+            (Decimal(submission.score) / source_max) * self.objective_quiz_max_score
+        ).quantize(Decimal('0.01'))
+        self.save()
+        return self
+
+    def save(self, *args, **kwargs):
+        self.recalculate()
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
 class Assignment(models.Model):
     ASSESSMENT_QUIZ = 'quiz'
     ASSESSMENT_PRACTICAL = 'practical'
@@ -187,6 +377,10 @@ class Assignment(models.Model):
     marks = models.PositiveSmallIntegerField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     is_active = models.BooleanField(default=True)
+    share_token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    is_public = models.BooleanField(default=False)
+    share_expires_at = models.DateTimeField(blank=True, null=True)
+    max_guest_attempts = models.PositiveIntegerField(blank=True, null=True)
 
     class Meta:
         ordering = ['due_date', '-created_at']

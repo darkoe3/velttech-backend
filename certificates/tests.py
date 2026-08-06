@@ -5,17 +5,19 @@ from django.core import mail
 from django.urls import reverse
 from django.utils import timezone
 from datetime import date
+from decimal import Decimal
 from unittest.mock import patch
 
 from rest_framework.test import APIClient
 
 from courses.models import Course
 from students.models import Student, Parent
-from enrollments.models import Assignment, AssignmentSubmission, Attendance, Enrollment
+from enrollments.models import Assignment, AssignmentSubmission, AssessmentResult, Attendance, Enrollment
 from payments.models import Payment
 from users.models import ActivityLog
 from notifications.models import Notification
 from .models import Certificate
+from .services import check_combined_result_certificate_eligibility
 
 User = get_user_model()
 
@@ -213,6 +215,87 @@ class CertificateModelTests(TestCase):
 
         self.assertTrue(pdf_bytes.startswith(b'%PDF'))
         self.assertGreater(len(pdf_bytes), 1000)
+
+    def test_combined_result_eligibility_allows_approved_passing_result(self):
+        result = AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+            is_approved=True,
+            approved_by=self.admin_user,
+            approved_at=timezone.now(),
+        )
+
+        eligibility = check_combined_result_certificate_eligibility(self.enrollment)
+
+        self.assertEqual(result.status, AssessmentResult.STATUS_APPROVED)
+        self.assertTrue(eligibility['eligible'])
+        self.assertEqual(eligibility['reasons'], [])
+        self.assertEqual(eligibility['percentage'], Decimal('80.00'))
+
+    def test_pending_payment_blocks_combined_result_eligibility(self):
+        AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+            is_approved=True,
+            approved_by=self.admin_user,
+            approved_at=timezone.now(),
+        )
+        self.payment.status = Payment.STATUS_PENDING
+        self.payment.save(update_fields=['status'])
+
+        eligibility = check_combined_result_certificate_eligibility(self.enrollment)
+
+        self.assertFalse(eligibility['eligible'])
+        self.assertFalse(eligibility['payments_settled'])
+        self.assertIn('Payments are not settled.', eligibility['reasons'])
+
+    def test_incomplete_enrollment_blocks_combined_result_eligibility(self):
+        AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+            is_approved=True,
+            approved_by=self.admin_user,
+            approved_at=timezone.now(),
+        )
+        self.enrollment.status = Enrollment.STATUS_ACTIVE
+        self.enrollment.save(update_fields=['status'])
+
+        eligibility = check_combined_result_certificate_eligibility(self.enrollment)
+
+        self.assertFalse(eligibility['eligible'])
+        self.assertFalse(eligibility['enrollment_completed'])
+        self.assertIn('Enrollment is not completed.', eligibility['reasons'])
+
+    def test_duplicate_certificate_blocks_combined_result_eligibility(self):
+        AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+            is_approved=True,
+            approved_by=self.admin_user,
+            approved_at=timezone.now(),
+        )
+        Certificate.objects.create(
+            student=self.student,
+            enrollment=self.enrollment,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_ACTIVE,
+            issued_by=self.admin_user,
+        )
+
+        eligibility = check_combined_result_certificate_eligibility(self.enrollment)
+
+        self.assertFalse(eligibility['eligible'])
+        self.assertTrue(eligibility['certificate_exists'])
+        self.assertIn('A valid certificate already exists for this enrollment.', eligibility['reasons'])
 
 
 @override_settings(

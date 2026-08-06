@@ -5,7 +5,7 @@ from courses.serializers import CourseSerializer
 from students.serializers import StudentSerializer
 from users.serializers import UserSerializer
 
-from .models import Assignment, AssignmentQuestion, AssignmentSubmission, Attendance, Enrollment, LessonNote, ProgressReport
+from .models import Assignment, AssignmentQuestion, AssignmentSubmission, AssessmentResult, Attendance, Enrollment, LessonNote, ProgressReport
 
 
 class EnrollmentSerializer(serializers.ModelSerializer):
@@ -261,6 +261,153 @@ class AssignmentSerializer(serializers.ModelSerializer):
             AssignmentQuestion(assignment=assignment, **question)
             for question in questions
         ])
+
+
+class AssignmentSharingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Assignment
+        fields = [
+            'is_public',
+            'share_expires_at',
+            'max_guest_attempts',
+        ]
+
+    def validate_max_guest_attempts(self, value):
+        if value is not None and value < 1:
+            raise serializers.ValidationError('Maximum guest attempts must be at least 1.')
+        return value
+
+
+class AssessmentResultSerializer(serializers.ModelSerializer):
+    enrollment_id = serializers.IntegerField(source='enrollment.id', read_only=True)
+    student_id = serializers.IntegerField(source='enrollment.student.id', read_only=True)
+    student_name = serializers.SerializerMethodField()
+    course_id = serializers.IntegerField(source='enrollment.course.id', read_only=True)
+    course_title = serializers.CharField(source='enrollment.course.title', read_only=True)
+    pass_mark = serializers.DecimalField(
+        source='enrollment.course.certificate_pass_mark',
+        max_digits=5,
+        decimal_places=2,
+        read_only=True,
+    )
+    instructor_id = serializers.IntegerField(source='enrollment.instructor.id', read_only=True)
+    approved_by_name = serializers.SerializerMethodField()
+    is_complete = serializers.BooleanField(read_only=True)
+    meets_pass_mark = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = AssessmentResult
+        fields = [
+            'id',
+            'enrollment_id',
+            'student_id',
+            'student_name',
+            'course_id',
+            'course_title',
+            'pass_mark',
+            'instructor_id',
+            'practical_max_score',
+            'practical_score',
+            'final_project_max_score',
+            'final_project_score',
+            'objective_quiz_max_score',
+            'objective_quiz_score',
+            'final_project_feedback',
+            'overall_score',
+            'total_max_score',
+            'percentage',
+            'status',
+            'is_complete',
+            'meets_pass_mark',
+            'is_approved',
+            'approved_by',
+            'approved_by_name',
+            'approved_at',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = [
+            'overall_score',
+            'total_max_score',
+            'percentage',
+            'status',
+            'is_approved',
+            'approved_by',
+            'approved_at',
+            'created_at',
+            'updated_at',
+        ]
+
+    def get_student_name(self, obj):
+        return str(obj.enrollment.student)
+
+    def get_approved_by_name(self, obj):
+        if not obj.approved_by:
+            return ''
+        return f'{obj.approved_by.first_name} {obj.approved_by.last_name}'.strip() or obj.approved_by.email
+
+
+class AssessmentResultUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AssessmentResult
+        fields = [
+            'practical_score',
+            'final_project_score',
+            'final_project_feedback',
+        ]
+
+    def validate(self, attrs):
+        instance = self.instance
+        practical_score = attrs.get('practical_score', instance.practical_score)
+        final_project_score = attrs.get('final_project_score', instance.final_project_score)
+        if practical_score is not None and practical_score > instance.practical_max_score:
+            raise serializers.ValidationError({
+                'practical_score': 'Practical score cannot exceed its maximum score.'
+            })
+        if final_project_score is not None and final_project_score > instance.final_project_max_score:
+            raise serializers.ValidationError({
+                'final_project_score': 'Final project score cannot exceed its maximum score.'
+            })
+        return attrs
+
+
+class AssessmentResultImportQuizSerializer(serializers.Serializer):
+    submission_id = serializers.IntegerField()
+
+    def validate_submission_id(self, value):
+        try:
+            return AssignmentSubmission.objects.select_related('assignment').get(pk=value)
+        except AssignmentSubmission.DoesNotExist:
+            raise serializers.ValidationError('Quiz submission not found.')
+
+
+class PublicAssessmentSerializer(serializers.ModelSerializer):
+    course = serializers.CharField(source='course.title', read_only=True)
+    duration = serializers.IntegerField(source='course.duration_months', read_only=True)
+    instructions = serializers.CharField(source='description', read_only=True)
+    question_count = serializers.IntegerField(source='questions.count', read_only=True)
+    start_date = serializers.SerializerMethodField()
+    end_date = serializers.DateField(source='due_date', read_only=True)
+    academy_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Assignment
+        fields = [
+            'title',
+            'course',
+            'duration',
+            'instructions',
+            'question_count',
+            'start_date',
+            'end_date',
+            'academy_name',
+        ]
+
+    def get_start_date(self, obj):
+        return obj.created_at.date() if obj.created_at else None
+
+    def get_academy_name(self, obj):
+        return 'Velttech Academy'
 
 
 class AssignmentSubmissionSerializer(serializers.ModelSerializer):

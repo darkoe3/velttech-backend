@@ -1,11 +1,13 @@
 from datetime import date
 from decimal import Decimal
 import logging
+import uuid
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.conf import settings
 from django.core.cache import cache
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.mail import send_mail
 from django.db import transaction
 from django.utils.encoding import force_str
@@ -26,6 +28,7 @@ from courses.models import Course
 from enrollments.models import (
     Assignment,
     AssignmentSubmission,
+    AssessmentResult,
     Attendance,
     Enrollment,
     LessonNote,
@@ -61,13 +64,22 @@ from .serializers import (
 )
 from enrollments.serializers import (
     AssignmentSerializer,
+    AssignmentSharingSerializer,
     AssignmentSubmissionSerializer,
+    AssessmentResultImportQuizSerializer,
+    AssessmentResultSerializer,
+    AssessmentResultUpdateSerializer,
     AttendanceSerializer,
     EnrollmentSerializer,
     LessonNoteSerializer,
     GradeAssignmentSubmissionSerializer,
     MyAssignmentSerializer,
+    PublicAssessmentSerializer,
     ProgressReportSerializer,
+)
+from certificates.services import (
+    check_combined_result_certificate_eligibility,
+    ensure_assessment_result,
 )
 
 User = get_user_model()
@@ -1709,6 +1721,95 @@ class InstructorProgressReportsView(generics.ListCreateAPIView):
         serializer.save(created_by=self.request.user)
 
 
+def instructor_assessment_results_queryset(user):
+    queryset = AssessmentResult.objects.select_related(
+        'enrollment',
+        'enrollment__student',
+        'enrollment__course',
+        'enrollment__instructor',
+        'approved_by',
+    )
+    if user.role == User.ROLE_ADMIN:
+        return queryset
+    return queryset.filter(enrollment__instructor=user)
+
+
+class InstructorAssessmentResultsView(generics.ListAPIView):
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
+    serializer_class = AssessmentResultSerializer
+
+    def get_queryset(self):
+        enrollments = Enrollment.objects.select_related(
+            'student',
+            'course',
+            'instructor',
+        )
+        if self.request.user.role != User.ROLE_ADMIN:
+            enrollments = enrollments.filter(instructor=self.request.user)
+        for enrollment in enrollments:
+            ensure_assessment_result(enrollment)
+        return instructor_assessment_results_queryset(self.request.user)
+
+
+class InstructorAssessmentResultDetailView(generics.UpdateAPIView):
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
+    serializer_class = AssessmentResultUpdateSerializer
+    http_method_names = ['patch']
+
+    def get_queryset(self):
+        return instructor_assessment_results_queryset(self.request.user)
+
+    def update(self, request, *args, **kwargs):
+        response = super().update(request, *args, **kwargs)
+        result = self.get_object()
+        response.data = AssessmentResultSerializer(result, context={'request': request}).data
+        return response
+
+
+class InstructorAssessmentResultImportQuizScoreView(APIView):
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
+
+    def post(self, request, pk):
+        result = generics.get_object_or_404(
+            instructor_assessment_results_queryset(request.user),
+            pk=pk,
+        )
+        serializer = AssessmentResultImportQuizSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            result.import_objective_quiz_submission(serializer.validated_data['submission_id'])
+        except DjangoValidationError as exc:
+            raise ValidationError({'detail': exc.message if hasattr(exc, 'message') else exc.messages})
+        result.refresh_from_db()
+        return Response(AssessmentResultSerializer(result, context={'request': request}).data)
+
+
+class InstructorAssessmentResultApproveView(APIView):
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
+
+    def post(self, request, pk):
+        result = generics.get_object_or_404(
+            instructor_assessment_results_queryset(request.user),
+            pk=pk,
+        )
+        try:
+            result.approve(request.user)
+        except DjangoValidationError as exc:
+            raise ValidationError({'detail': exc.message if hasattr(exc, 'message') else exc.messages})
+        return Response(AssessmentResultSerializer(result, context={'request': request}).data)
+
+
+class InstructorAssessmentResultCertificateEligibilityView(APIView):
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
+
+    def get(self, request, pk):
+        result = generics.get_object_or_404(
+            instructor_assessment_results_queryset(request.user),
+            pk=pk,
+        )
+        return Response(check_combined_result_certificate_eligibility(result.enrollment))
+
+
 class InstructorAssignmentsView(generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
     serializer_class = AssignmentSerializer
@@ -1751,6 +1852,41 @@ class InstructorAssignmentDetailView(generics.RetrieveUpdateDestroyAPIView):
             serializer.save()
         else:
             serializer.save(instructor=self.request.user)
+
+
+class InstructorAssessmentGenerateLinkView(APIView):
+    permission_classes = [permissions.IsAuthenticated, IsInstructorUserRole]
+
+    def post(self, request, pk):
+        assignment = generics.get_object_or_404(
+            Assignment.objects.select_related('course', 'instructor').filter(instructor=request.user),
+            pk=pk,
+        )
+        update_fields = []
+        if not assignment.share_token:
+            assignment.share_token = uuid.uuid4()
+            update_fields.append('share_token')
+        if not assignment.is_public:
+            assignment.is_public = True
+            update_fields.append('is_public')
+        if update_fields:
+            assignment.save(update_fields=update_fields)
+
+        return Response({
+            'share_url': request.build_absolute_uri(f'/assessment/{assignment.share_token}'),
+            'token': str(assignment.share_token),
+            'expires_at': assignment.share_expires_at,
+            'is_public': assignment.is_public,
+        })
+
+
+class InstructorAssessmentSharingView(generics.UpdateAPIView):
+    permission_classes = [permissions.IsAuthenticated, IsInstructorUserRole]
+    serializer_class = AssignmentSharingSerializer
+    http_method_names = ['patch']
+
+    def get_queryset(self):
+        return Assignment.objects.filter(instructor=self.request.user)
 
 
 class InstructorSubmissionsView(generics.ListAPIView):
@@ -1911,6 +2047,27 @@ class MyAssignmentsView(generics.ListAPIView):
             )
 
         return queryset.none()
+
+
+class PublicAssessmentView(generics.RetrieveAPIView):
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+    serializer_class = PublicAssessmentSerializer
+    lookup_field = 'share_token'
+    lookup_url_kwarg = 'token'
+
+    def get_queryset(self):
+        return Assignment.objects.select_related('course').prefetch_related('questions')
+
+    def get_object(self):
+        assignment = super().get_object()
+        if not assignment.is_public:
+            raise PermissionDenied('This assessment is not publicly available.')
+        if not assignment.is_active:
+            raise PermissionDenied('This assessment is not currently available.')
+        if assignment.share_expires_at and assignment.share_expires_at <= timezone.now():
+            raise PermissionDenied('This assessment link has expired.')
+        return assignment
 
 
 class SubmitAssignmentView(APIView):

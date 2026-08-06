@@ -4,6 +4,7 @@ from .models import (
     Assignment,
     AssignmentQuestion,
     AssignmentSubmission,
+    AssessmentResult,
     Attendance,
     Enrollment,
     LessonNote,
@@ -42,6 +43,46 @@ class ProgressReportAdmin(admin.ModelAdmin):
     list_display = ('enrollment', 'progress_score', 'created_by', 'created_at')
     list_filter = ('progress_score', 'created_at')
     search_fields = ('enrollment__student__first_name', 'enrollment__student__last_name')
+
+
+@admin.register(AssessmentResult)
+class AssessmentResultAdmin(admin.ModelAdmin):
+    list_display = (
+        'enrollment',
+        'learner',
+        'course',
+        'practical_score',
+        'final_project_score',
+        'objective_quiz_score',
+        'overall_score',
+        'percentage',
+        'status',
+        'is_approved',
+        'approved_by',
+        'approved_at',
+    )
+    list_filter = ('status', 'is_approved', 'enrollment__course')
+    search_fields = (
+        'enrollment__student__first_name',
+        'enrollment__student__last_name',
+        'enrollment__course__title',
+    )
+    readonly_fields = (
+        'overall_score',
+        'total_max_score',
+        'percentage',
+        'status',
+        'approved_by',
+        'approved_at',
+        'created_at',
+        'updated_at',
+    )
+
+    def learner(self, obj):
+        return obj.enrollment.student
+
+    def course(self, obj):
+        return obj.enrollment.course
 
 
 class AssignmentQuestionInline(admin.TabularInline):

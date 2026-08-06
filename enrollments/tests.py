@@ -1,3 +1,8 @@
+import uuid
+from decimal import Decimal
+
+from django.core.exceptions import ValidationError
+from django.utils import timezone
 from django.contrib.auth import get_user_model
 from django.test import override_settings
 from django.urls import reverse
@@ -5,9 +10,10 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from courses.models import Course
+from payments.models import Payment
 from students.models import Parent, Student
 
-from .models import Assignment, AssignmentQuestion, AssignmentSubmission, Enrollment
+from .models import Assignment, AssignmentQuestion, AssignmentSubmission, AssessmentResult, Enrollment
 
 
 User = get_user_model()
@@ -112,6 +118,15 @@ class InstructorGradingTests(APITestCase):
 
     def submit_url(self, assignment):
         return reverse('submit_assignment', args=[assignment.id])
+
+    def generate_link_url(self, assignment):
+        return reverse('instructor-assessment-generate-link', args=[assignment.id])
+
+    def sharing_url(self, assignment):
+        return reverse('instructor-assessment-sharing', args=[assignment.id])
+
+    def public_assessment_url(self, assignment):
+        return reverse('public-assessment', args=[assignment.share_token])
 
     def create_student_for_other_instructor(self):
         student_user = User.objects.create_user(
@@ -604,3 +619,341 @@ class InstructorGradingTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assignment.refresh_from_db()
         self.assertEqual(self.assignment.title, 'Admin Updated')
+
+    def test_instructor_can_generate_public_assessment_token(self):
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.post(self.generate_link_url(self.assignment))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assignment.refresh_from_db()
+        self.assertTrue(self.assignment.is_public)
+        self.assertEqual(response.data['token'], str(self.assignment.share_token))
+        self.assertIn(f'/assessment/{self.assignment.share_token}', response.data['share_url'])
+        self.assertIsNone(response.data['expires_at'])
+
+    def test_instructor_can_update_assessment_sharing_settings(self):
+        self.client.force_authenticate(self.instructor)
+        expires_at = timezone.now() + timezone.timedelta(days=3)
+
+        response = self.client.patch(
+            self.sharing_url(self.assignment),
+            {
+                'is_public': True,
+                'share_expires_at': expires_at.isoformat(),
+                'max_guest_attempts': 2,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assignment.refresh_from_db()
+        self.assertTrue(self.assignment.is_public)
+        self.assertEqual(self.assignment.max_guest_attempts, 2)
+        self.assertIsNotNone(self.assignment.share_expires_at)
+
+    def test_public_assessment_endpoint_returns_safe_metadata_only(self):
+        self.assignment.is_public = True
+        self.assignment.save(update_fields=['is_public'])
+        AssignmentQuestion.objects.create(
+            assignment=self.assignment,
+            question_text='Hidden question.',
+            option_a='A',
+            option_b='B',
+            option_c='C',
+            option_d='D',
+            correct_answer='A',
+            marks=5,
+        )
+
+        response = self.client.get(self.public_assessment_url(self.assignment))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['title'], self.assignment.title)
+        self.assertEqual(response.data['course'], self.course.title)
+        self.assertEqual(response.data['duration'], self.course.duration_months)
+        self.assertEqual(response.data['instructions'], self.assignment.description)
+        self.assertEqual(response.data['question_count'], 1)
+        self.assertEqual(response.data['end_date'], self.assignment.due_date)
+        self.assertEqual(response.data['academy_name'], 'Velttech Academy')
+        self.assertNotIn('questions', response.data)
+        self.assertNotIn('answers', response.data)
+        self.assertNotIn('correct_answer', response.data)
+        self.assertNotIn('marks', response.data)
+
+    def test_public_assessment_rejects_expired_link(self):
+        self.assignment.is_public = True
+        self.assignment.share_expires_at = timezone.now() - timezone.timedelta(minutes=1)
+        self.assignment.save(update_fields=['is_public', 'share_expires_at'])
+
+        response = self.client.get(self.public_assessment_url(self.assignment))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_public_assessment_rejects_private_assessment(self):
+        response = self.client.get(self.public_assessment_url(self.assignment))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_other_instructor_cannot_manage_assessment_sharing(self):
+        self.client.force_authenticate(self.other_instructor)
+
+        generate_response = self.client.post(self.generate_link_url(self.assignment))
+        sharing_response = self.client.patch(
+            self.sharing_url(self.assignment),
+            {'is_public': True},
+            format='json',
+        )
+
+        self.assertEqual(generate_response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(sharing_response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_public_assessment_rejects_invalid_token(self):
+        response = self.client.get(reverse('public-assessment', args=[uuid.uuid4()]))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_public_assessment_rejects_draft_assessment(self):
+        self.assignment.is_public = True
+        self.assignment.is_active = False
+        self.assignment.save(update_fields=['is_public', 'is_active'])
+
+        response = self.client.get(self.public_assessment_url(self.assignment))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+@override_settings(SECURE_SSL_REDIRECT=False, MIDDLEWARE=[])
+class AssessmentResultPhaseOneTests(APITestCase):
+    def setUp(self):
+        self.instructor = User.objects.create_user(
+            email='phase1-instructor@example.com',
+            password='pass',
+            first_name='Phase',
+            last_name='Instructor',
+            role=User.ROLE_INSTRUCTOR,
+            approval_status=User.APPROVAL_APPROVED,
+        )
+        self.other_instructor = User.objects.create_user(
+            email='phase1-other@example.com',
+            password='pass',
+            first_name='Other',
+            last_name='Instructor',
+            role=User.ROLE_INSTRUCTOR,
+            approval_status=User.APPROVAL_APPROVED,
+        )
+        self.admin = User.objects.create_user(
+            email='phase1-admin@example.com',
+            password='pass',
+            first_name='Admin',
+            last_name='User',
+            role=User.ROLE_ADMIN,
+            approval_status=User.APPROVAL_APPROVED,
+        )
+        self.student_user = User.objects.create_user(
+            email='phase1-student@example.com',
+            password='pass',
+            first_name='Result',
+            last_name='Learner',
+            role=User.ROLE_STUDENT,
+            approval_status=User.APPROVAL_APPROVED,
+        )
+        self.student = Student.objects.create(
+            user=self.student_user,
+            first_name='Result',
+            last_name='Learner',
+            email='phase1-student-profile@example.com',
+            learner_type=Student.LEARNER_ADULT,
+            approval_status=Student.STATUS_APPROVED,
+        )
+        self.course = Course.objects.create(
+            title='Assessment Integration',
+            description='Phase one course',
+            duration_months=2,
+            monthly_fee=100,
+            fee=200,
+            certificate_pass_mark=Decimal('70.00'),
+        )
+        self.enrollment = Enrollment.objects.create(
+            student=self.student,
+            course=self.course,
+            instructor=self.instructor,
+            status=Enrollment.STATUS_COMPLETED,
+        )
+        Payment.objects.create(
+            enrollment=self.enrollment,
+            amount=200,
+            status=Payment.STATUS_PAID,
+        )
+
+    def assessment_results_url(self):
+        return reverse('instructor-assessment-results')
+
+    def assessment_result_detail_url(self, result):
+        return reverse('instructor-assessment-result-detail', args=[result.id])
+
+    def import_quiz_url(self, result):
+        return reverse('instructor-assessment-result-import-quiz-score', args=[result.id])
+
+    def approve_url(self, result):
+        return reverse('instructor-assessment-result-approve', args=[result.id])
+
+    def test_one_result_per_enrollment_is_created_on_list_access(self):
+        self.client.force_authenticate(self.instructor)
+
+        first = self.client.get(self.assessment_results_url())
+        second = self.client.get(self.assessment_results_url())
+
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.assertEqual(second.status_code, status.HTTP_200_OK)
+        self.assertEqual(AssessmentResult.objects.filter(enrollment=self.enrollment).count(), 1)
+
+    def test_score_maximum_validation(self):
+        result = AssessmentResult.objects.create(enrollment=self.enrollment)
+
+        result.practical_score = Decimal('41.00')
+        with self.assertRaises(ValidationError):
+            result.full_clean()
+        result.practical_score = None
+
+        result.final_project_score = Decimal('41.00')
+        with self.assertRaises(ValidationError):
+            result.full_clean()
+        result.final_project_score = None
+
+        result.objective_quiz_score = Decimal('21.00')
+        with self.assertRaises(ValidationError):
+            result.full_clean()
+
+    def test_total_percentage_and_incomplete_status(self):
+        result = AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('30.00'),
+            final_project_score=Decimal('20.00'),
+        )
+
+        self.assertEqual(result.total_max_score, Decimal('100.00'))
+        self.assertEqual(result.overall_score, Decimal('50.00'))
+        self.assertEqual(result.percentage, Decimal('50.00'))
+        self.assertEqual(result.status, AssessmentResult.STATUS_INCOMPLETE)
+
+    def test_below_pass_and_ready_for_review_statuses(self):
+        below = AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('20.00'),
+            final_project_score=Decimal('20.00'),
+            objective_quiz_score=Decimal('10.00'),
+        )
+        self.assertEqual(below.status, AssessmentResult.STATUS_BELOW_PASS_MARK)
+
+        below.practical_score = Decimal('35.00')
+        below.final_project_score = Decimal('30.00')
+        below.objective_quiz_score = Decimal('15.00')
+        below.save()
+        self.assertEqual(below.status, AssessmentResult.STATUS_READY_FOR_REVIEW)
+
+    def test_instructor_and_admin_approval(self):
+        result = AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+        )
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.post(self.approve_url(result))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result.refresh_from_db()
+        self.assertTrue(result.is_approved)
+        self.assertEqual(result.status, AssessmentResult.STATUS_APPROVED)
+        self.assertEqual(result.approved_by, self.instructor)
+        self.assertIsNotNone(result.approved_at)
+
+        second_student = Student.objects.create(
+            first_name='Admin',
+            last_name='Approved',
+            email='phase1-admin-approved@example.com',
+            learner_type=Student.LEARNER_ADULT,
+            approval_status=Student.STATUS_APPROVED,
+        )
+        second_enrollment = Enrollment.objects.create(
+            student=second_student,
+            course=self.course,
+            instructor=self.other_instructor,
+            status=Enrollment.STATUS_COMPLETED,
+        )
+        second_result = AssessmentResult.objects.create(
+            enrollment=second_enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('35.00'),
+            objective_quiz_score=Decimal('15.00'),
+        )
+        self.client.force_authenticate(self.admin)
+
+        admin_response = self.client.post(self.approve_url(second_result))
+
+        self.assertEqual(admin_response.status_code, status.HTTP_200_OK)
+        second_result.refresh_from_db()
+        self.assertEqual(second_result.approved_by, self.admin)
+
+    def test_instructor_cannot_approve_another_instructors_learner(self):
+        result = AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+        )
+        self.client.force_authenticate(self.other_instructor)
+
+        response = self.client.post(self.approve_url(result))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        result.refresh_from_db()
+        self.assertFalse(result.is_approved)
+
+    def test_objective_quiz_score_import_scales_selected_submission(self):
+        result = AssessmentResult.objects.create(enrollment=self.enrollment)
+        quiz = Assignment.objects.create(
+            title='Objective Quiz',
+            description='Auto graded quiz.',
+            course=self.course,
+            instructor=self.instructor,
+            due_date='2026-08-01',
+            submission_type=Assignment.ASSESSMENT_QUIZ,
+            marks=50,
+        )
+        submission = AssignmentSubmission.objects.create(
+            assignment=quiz,
+            student=self.student,
+            score=25,
+            max_score=50,
+            status=AssignmentSubmission.STATUS_GRADED,
+        )
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.post(
+            self.import_quiz_url(result),
+            {'submission_id': submission.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result.refresh_from_db()
+        self.assertEqual(result.objective_quiz_score, Decimal('10.00'))
+
+    def test_no_certificate_is_automatically_issued(self):
+        from certificates.models import Certificate
+
+        result = AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+        )
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.post(self.approve_url(result))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(Certificate.objects.filter(enrollment=self.enrollment).exists())

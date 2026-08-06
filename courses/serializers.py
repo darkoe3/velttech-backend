@@ -13,5 +13,6 @@ class CourseSerializer(serializers.ModelSerializer):
             'duration_months',
             'monthly_fee',
             'fee',
+            'certificate_pass_mark',
             'is_active',
         ]
