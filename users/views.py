@@ -1766,6 +1766,30 @@ class InstructorAssessmentResultDetailView(generics.UpdateAPIView):
         return response
 
 
+class MyAssessmentResultsView(generics.ListAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = AssessmentResultSerializer
+
+    def get_queryset(self):
+        enforce_student_approved(self.request.user)
+        queryset = AssessmentResult.objects.select_related(
+            'enrollment',
+            'enrollment__student',
+            'enrollment__course',
+            'enrollment__instructor',
+            'approved_by',
+            'enrollment__certificate',
+        )
+        user = self.request.user
+        if user.role == User.ROLE_ADMIN:
+            return queryset
+        if user.role == User.ROLE_PARENT:
+            return queryset.filter(enrollment__student__parent__user=user)
+        if user.role == User.ROLE_STUDENT:
+            return queryset.filter(enrollment__student__user=user)
+        return queryset.none()
+
+
 class InstructorAssessmentResultImportQuizScoreView(APIView):
     permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
 
@@ -1774,6 +1798,10 @@ class InstructorAssessmentResultImportQuizScoreView(APIView):
             instructor_assessment_results_queryset(request.user),
             pk=pk,
         )
+        if result.status == AssessmentResult.STATUS_CERTIFICATE_ISSUED:
+            raise ValidationError({'detail': 'Certified assessment results cannot be changed.'})
+        if result.is_approved and request.user.role != User.ROLE_ADMIN:
+            raise ValidationError({'detail': 'Approved assessment results cannot be changed by instructors.'})
         serializer = AssessmentResultImportQuizSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:

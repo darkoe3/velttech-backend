@@ -386,33 +386,26 @@ class CertificateEligibilityListView(generics.ListAPIView):
         """Return list of eligible students (not certificates)"""
         from enrollments.models import Enrollment
         from students.serializers import StudentSerializer
+        from .services import check_combined_result_certificate_eligibility
 
         queryset = self.get_queryset()
         eligible_students = []
 
         for enrollment in queryset:
-            # Check if already has issued certificate
-            has_issued = Certificate.objects.filter(
-                enrollment=enrollment,
-                status__in=[Certificate.STATUS_ACTIVE, Certificate.STATUS_LEGACY_ISSUED],
-            ).exists()
-
-            certificate_probe = Certificate(
-                student=enrollment.student,
-                enrollment=enrollment,
-                course=enrollment.course,
-                completion_date=enrollment.end_date or enrollment.updated_at.date(),
-            )
-
-            if not has_issued and certificate_probe.is_eligible_for_certificate():
+            eligibility = check_combined_result_certificate_eligibility(enrollment)
+            result = getattr(enrollment, 'assessment_result', None)
+            if eligibility['eligible']:
                 eligible_students.append({
                     'id': enrollment.student.id,
                     'enrollment_id': enrollment.id,
+                    'assessment_result_id': result.id if result else None,
                     'name': self._get_student_name(enrollment.student),
                     'email': enrollment.student.email,
                     'status': enrollment.student.approval_status,
                     'enrollment_status': enrollment.status,
                     'course_title': enrollment.course.title,
+                    'percentage': eligibility['percentage'],
+                    'pass_mark': eligibility['pass_mark'],
                 })
 
         return Response(eligible_students)

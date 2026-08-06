@@ -942,6 +942,72 @@ class AssessmentResultPhaseOneTests(APITestCase):
         result.refresh_from_db()
         self.assertEqual(result.objective_quiz_score, Decimal('10.00'))
 
+    def test_instructor_records_practical_score(self):
+        result = AssessmentResult.objects.create(enrollment=self.enrollment)
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.patch(
+            self.assessment_result_detail_url(result),
+            {'practical_score': '32.50'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result.refresh_from_db()
+        self.assertEqual(result.practical_score, Decimal('32.50'))
+
+    def test_instructor_records_final_project_score_and_feedback(self):
+        result = AssessmentResult.objects.create(enrollment=self.enrollment)
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.patch(
+            self.assessment_result_detail_url(result),
+            {
+                'final_project_score': '34.00',
+                'final_project_feedback': 'Clear project with good documentation.',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result.refresh_from_db()
+        self.assertEqual(result.final_project_score, Decimal('34.00'))
+        self.assertEqual(result.final_project_feedback, 'Clear project with good documentation.')
+
+    def test_invalid_component_score_is_rejected_by_api(self):
+        result = AssessmentResult.objects.create(enrollment=self.enrollment)
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.patch(
+            self.assessment_result_detail_url(result),
+            {'practical_score': '41.00'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('practical_score', response.data)
+
+    def test_instructor_cannot_edit_after_approval(self):
+        result = AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+            is_approved=True,
+            approved_by=self.admin,
+            approved_at=timezone.now(),
+        )
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.patch(
+            self.assessment_result_detail_url(result),
+            {'practical_score': '36.00'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Approved assessment results cannot be changed by instructors.', str(response.data))
+
     def test_no_certificate_is_automatically_issued(self):
         from certificates.models import Certificate
 

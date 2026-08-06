@@ -5,7 +5,8 @@ from rest_framework import serializers
 from django.utils import timezone
 
 from .models import Certificate
-from enrollments.models import Enrollment
+from enrollments.models import AssessmentResult, Enrollment
+from .services import check_combined_result_certificate_eligibility
 
 
 CERTIFICATE_PROGRAMME_NAME = 'Young Innovators Academy'
@@ -168,6 +169,7 @@ class CertificateListSerializer(serializers.ModelSerializer):
 class CertificateIssuanceSerializer(serializers.Serializer):
     """Serializer for issuing certificates"""
     enrollment_id = serializers.IntegerField()
+    assessment_result_id = serializers.IntegerField(required=False)
     completion_date = serializers.DateField()
     certificate_type = serializers.ChoiceField(
         choices=Certificate.CERTIFICATE_TYPE_CHOICES,
@@ -200,10 +202,10 @@ class CertificateIssuanceSerializer(serializers.Serializer):
         except Enrollment.DoesNotExist:
             raise serializers.ValidationError("Enrollment not found.")
 
-        # Check if certificate already exists and is issued
         existing_cert = Certificate.objects.filter(
             student=enrollment.student,
             course=enrollment.course,
+            status__in=[Certificate.STATUS_ACTIVE, Certificate.STATUS_LEGACY_ISSUED],
         ).exists()
 
         if existing_cert:
@@ -216,13 +218,28 @@ class CertificateIssuanceSerializer(serializers.Serializer):
     def validate(self, data):
         enrollment = Enrollment.objects.get(id=data['enrollment_id'])
         request = self.context.get('request')
+        result = getattr(enrollment, 'assessment_result', None)
 
         if request and request.user.role == 'instructor' and enrollment.instructor_id != request.user.id:
             raise serializers.ValidationError(
                 "You can only issue certificates for your assigned learners."
             )
 
-        final_score = data.get('final_score', calculate_final_score(enrollment))
+        assessment_result_id = data.get('assessment_result_id')
+        if assessment_result_id:
+            if not result or result.id != assessment_result_id:
+                raise serializers.ValidationError({
+                    'assessment_result_id': 'Assessment result does not belong to this enrollment.'
+                })
+
+        eligibility = check_combined_result_certificate_eligibility(enrollment)
+        if not eligibility['eligible']:
+            raise serializers.ValidationError({
+                'detail': 'Certificate cannot be issued for this assessment result.',
+                'reasons': eligibility['reasons'],
+            })
+
+        final_score = data.get('final_score', result.percentage if result else calculate_final_score(enrollment))
         certificate_type = data.get('certificate_type', default_certificate_type(final_score))
 
         if certificate_type == Certificate.TYPE_EXCELLENCE and (
@@ -232,26 +249,13 @@ class CertificateIssuanceSerializer(serializers.Serializer):
                 "Excellence certificates require an academy excellence score of at least 90%."
             )
 
-        certificate = Certificate(
-            student=enrollment.student,
-            enrollment=enrollment,
-            course=enrollment.course,
-            completion_date=data['completion_date'],
-        )
-
-        if not certificate.is_eligible_for_certificate():
-            raise serializers.ValidationError(
-                "Student is not eligible for a certificate. "
-                "Ensure enrollment is completed, student is approved, "
-                "and all payments are settled."
-            )
-
         return data
 
     def create(self, validated_data):
         enrollment = Enrollment.objects.get(id=validated_data['enrollment_id'])
         user = self.context['request'].user
-        final_score = validated_data.get('final_score', calculate_final_score(enrollment))
+        result = enrollment.assessment_result
+        final_score = validated_data.get('final_score', result.percentage)
         attendance_percentage = validated_data.get(
             'attendance_percentage',
             calculate_attendance_percentage(enrollment),
@@ -296,6 +300,8 @@ class CertificateIssuanceSerializer(serializers.Serializer):
             certificate.skills_covered = validated_data.get('skills_covered', [])
             certificate.save()
 
+        result.status = AssessmentResult.STATUS_CERTIFICATE_ISSUED
+        result.save(update_fields=['status', 'updated_at'])
         return certificate
 
 

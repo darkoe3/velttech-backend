@@ -294,6 +294,9 @@ class AssessmentResultSerializer(serializers.ModelSerializer):
     approved_by_name = serializers.SerializerMethodField()
     is_complete = serializers.BooleanField(read_only=True)
     meets_pass_mark = serializers.BooleanField(read_only=True)
+    certificate_id = serializers.SerializerMethodField()
+    certificate_number = serializers.SerializerMethodField()
+    certificate_status = serializers.SerializerMethodField()
 
     class Meta:
         model = AssessmentResult
@@ -319,6 +322,9 @@ class AssessmentResultSerializer(serializers.ModelSerializer):
             'status',
             'is_complete',
             'meets_pass_mark',
+            'certificate_id',
+            'certificate_number',
+            'certificate_status',
             'is_approved',
             'approved_by',
             'approved_by_name',
@@ -346,6 +352,23 @@ class AssessmentResultSerializer(serializers.ModelSerializer):
             return ''
         return f'{obj.approved_by.first_name} {obj.approved_by.last_name}'.strip() or obj.approved_by.email
 
+    def get_certificate(self, obj):
+        return getattr(obj.enrollment, 'certificate', None)
+
+    def get_certificate_id(self, obj):
+        certificate = self.get_certificate(obj)
+        return certificate.id if certificate else None
+
+    def get_certificate_number(self, obj):
+        certificate = self.get_certificate(obj)
+        return certificate.certificate_number if certificate else ''
+
+    def get_certificate_status(self, obj):
+        certificate = self.get_certificate(obj)
+        if not certificate:
+            return ''
+        return 'issued' if certificate.is_active() else certificate.status
+
 
 class AssessmentResultUpdateSerializer(serializers.ModelSerializer):
     class Meta:
@@ -358,6 +381,13 @@ class AssessmentResultUpdateSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         instance = self.instance
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        certificate = getattr(instance.enrollment, 'certificate', None)
+        if certificate and certificate.is_active():
+            raise serializers.ValidationError('Certified assessment results cannot be changed. Use certificate revoke/reissue for material corrections.')
+        if instance.is_approved and getattr(user, 'role', None) != 'admin':
+            raise serializers.ValidationError('Approved assessment results cannot be changed by instructors.')
         practical_score = attrs.get('practical_score', instance.practical_score)
         final_project_score = attrs.get('final_project_score', instance.final_project_score)
         if practical_score is not None and practical_score > instance.practical_max_score:
@@ -416,6 +446,7 @@ class AssignmentSubmissionSerializer(serializers.ModelSerializer):
     assignment_due_date = serializers.DateField(source='assignment.due_date', read_only=True)
     assignment_submission_type = serializers.CharField(source='assignment.submission_type', read_only=True)
     assignment_marks = serializers.IntegerField(source='assignment.marks', read_only=True)
+    assignment_course = serializers.IntegerField(source='assignment.course.id', read_only=True)
     course_title = serializers.CharField(source='assignment.course.title', read_only=True)
     student_name = serializers.SerializerMethodField()
     grade = serializers.IntegerField(source='score', read_only=True)
@@ -431,6 +462,7 @@ class AssignmentSubmissionSerializer(serializers.ModelSerializer):
             'assignment_due_date',
             'assignment_submission_type',
             'assignment_marks',
+            'assignment_course',
             'course_title',
             'student',
             'student_name',

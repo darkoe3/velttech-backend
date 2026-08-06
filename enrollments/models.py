@@ -296,6 +296,8 @@ class AssessmentResult(models.Model):
             self.status = self.STATUS_INCOMPLETE
         elif self.percentage < self.enrollment.course.certificate_pass_mark:
             self.status = self.STATUS_BELOW_PASS_MARK
+        elif self.status == self.STATUS_CERTIFICATE_ISSUED and self.is_approved:
+            self.status = self.STATUS_CERTIFICATE_ISSUED
         elif self.is_approved:
             self.status = self.STATUS_APPROVED
         else:
@@ -314,6 +316,10 @@ class AssessmentResult(models.Model):
         self.save()
 
     def import_objective_quiz_submission(self, submission):
+        if self.status == self.STATUS_CERTIFICATE_ISSUED:
+            raise ValidationError('Certified assessment results cannot be changed.')
+        if self.is_approved:
+            raise ValidationError('Approved assessment results cannot be changed by quiz import.')
         if submission.student_id != self.enrollment.student_id:
             raise ValidationError('Quiz submission does not belong to this learner.')
         if submission.assignment.course_id != self.enrollment.course_id:

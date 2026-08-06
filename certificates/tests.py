@@ -311,6 +311,7 @@ class CertificateAPITests(CertificateModelTests):
     @patch('certificates.pdf_generator.CertificatePDFGenerator')
     def test_admin_issues_certificate(self, generator_cls):
         generator_cls.return_value.save_to_certificate.return_value = None
+        self._create_approved_assessment_result()
         self.client.force_authenticate(self.admin_user)
 
         response = self.client.post(reverse('certificate-issue'), {
@@ -377,6 +378,15 @@ class CertificateAPITests(CertificateModelTests):
             amount=300.00,
             status='paid',
         )
+        AssessmentResult.objects.create(
+            enrollment=adult_enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+            is_approved=True,
+            approved_by=self.admin_user,
+            approved_at=timezone.now(),
+        )
         self.client.force_authenticate(self.admin_user)
 
         response = self.client.post(reverse('certificate-issue'), {
@@ -403,6 +413,7 @@ class CertificateAPITests(CertificateModelTests):
         from .notifications import send_certificate_issued_notification
 
         generator_cls.return_value.save_to_certificate.return_value = None
+        self._create_approved_assessment_result()
         self.client.force_authenticate(self.admin_user)
 
         response = self.client.post(reverse('certificate-issue'), {
@@ -429,6 +440,7 @@ class CertificateAPITests(CertificateModelTests):
     def test_certificate_issuance_succeeds_when_notification_email_fails(self, generator_cls, send_mail_mock, logger_mock):
         generator_cls.return_value.save_to_certificate.return_value = None
         send_mail_mock.side_effect = RuntimeError('SMTP unavailable')
+        self._create_approved_assessment_result()
         self.client.force_authenticate(self.admin_user)
 
         response = self.client.post(reverse('certificate-issue'), {
@@ -446,6 +458,7 @@ class CertificateAPITests(CertificateModelTests):
     @patch('certificates.pdf_generator.CertificatePDFGenerator')
     def test_instructor_can_only_issue_assigned_certificate(self, generator_cls):
         generator_cls.return_value.save_to_certificate.return_value = None
+        self._create_approved_assessment_result()
         self.client.force_authenticate(self.other_instructor)
 
         response = self.client.post(reverse('certificate-issue'), {
@@ -458,6 +471,7 @@ class CertificateAPITests(CertificateModelTests):
     @patch('certificates.pdf_generator.CertificatePDFGenerator')
     def test_duplicate_certificate_is_blocked(self, generator_cls):
         generator_cls.return_value.save_to_certificate.return_value = None
+        self._create_approved_assessment_result()
         self.client.force_authenticate(self.admin_user)
         payload = {
             'enrollment_id': self.enrollment.id,
@@ -469,6 +483,67 @@ class CertificateAPITests(CertificateModelTests):
 
         self.assertEqual(first.status_code, 201)
         self.assertEqual(second.status_code, 400)
+
+    @patch('certificates.pdf_generator.CertificatePDFGenerator')
+    def test_result_status_becomes_certificate_issued_after_issue(self, generator_cls):
+        generator_cls.return_value.save_to_certificate.return_value = None
+        self.assessment_result = self._create_approved_assessment_result()
+        self.client.force_authenticate(self.admin_user)
+
+        response = self.client.post(reverse('certificate-issue'), {
+            'enrollment_id': self.enrollment.id,
+            'assessment_result_id': self.assessment_result.id,
+            'completion_date': date.today().isoformat(),
+        }, format='json')
+
+        self.assertEqual(response.status_code, 201)
+        self.assessment_result.refresh_from_db()
+        self.assertEqual(self.assessment_result.status, AssessmentResult.STATUS_CERTIFICATE_ISSUED)
+
+    def test_incomplete_result_cannot_issue_certificate(self):
+        self.assessment_result = self._create_approved_assessment_result()
+        self.assessment_result.practical_score = None
+        self.assessment_result.is_approved = False
+        self.assessment_result.save()
+        self.client.force_authenticate(self.admin_user)
+
+        response = self.client.post(reverse('certificate-issue'), {
+            'enrollment_id': self.enrollment.id,
+            'completion_date': date.today().isoformat(),
+        }, format='json')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('Combined assessment result is incomplete.', response.data['reasons'])
+
+    def test_unapproved_result_cannot_issue_certificate(self):
+        self.assessment_result = self._create_approved_assessment_result()
+        self.assessment_result.is_approved = False
+        self.assessment_result.approved_by = None
+        self.assessment_result.approved_at = None
+        self.assessment_result.save()
+        self.client.force_authenticate(self.admin_user)
+
+        response = self.client.post(reverse('certificate-issue'), {
+            'enrollment_id': self.enrollment.id,
+            'completion_date': date.today().isoformat(),
+        }, format='json')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('Combined assessment result is not approved.', response.data['reasons'])
+
+    def test_outstanding_payment_blocks_issuance(self):
+        self._create_approved_assessment_result()
+        self.payment.status = Payment.STATUS_PENDING
+        self.payment.save(update_fields=['status'])
+        self.client.force_authenticate(self.admin_user)
+
+        response = self.client.post(reverse('certificate-issue'), {
+            'enrollment_id': self.enrollment.id,
+            'completion_date': date.today().isoformat(),
+        }, format='json')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('Payments are not settled.', response.data['reasons'])
 
     def test_student_downloads_own_certificate(self):
         cert = self._create_certificate_with_file()
@@ -648,6 +723,7 @@ class CertificateAPITests(CertificateModelTests):
     @patch('certificates.pdf_generator.CertificatePDFGenerator')
     def test_issue_certificate_calculates_score_grade_and_attendance(self, generator_cls):
         generator_cls.return_value.save_to_certificate.return_value = None
+        self._create_approved_assessment_result()
         assignment = Assignment.objects.create(
             title='Final Project',
             description='Build a project.',
@@ -684,14 +760,101 @@ class CertificateAPITests(CertificateModelTests):
         }, format='json')
 
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.data['final_score'], '85.00')
+        self.assertEqual(response.data['final_score'], '80.00')
         self.assertEqual(response.data['final_grade'], 'A')
         self.assertEqual(response.data['attendance_percentage'], '50.00')
+
+    def test_certificate_pdf_still_excludes_assessment_metrics(self):
+        from .pdf_generator import CertificatePDFGenerator
+
+        cert = Certificate.objects.create(
+            student=self.student,
+            enrollment=self.enrollment,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_ISSUED,
+            issued_by=self.admin_user,
+            final_score=88,
+            final_grade='A',
+            attendance_percentage=100,
+        )
+
+        pdf_bytes = CertificatePDFGenerator(cert).generate_pdf()
+
+        self.assertNotIn(b'88', pdf_bytes)
+        self.assertNotIn(b'100%', pdf_bytes)
+        self.assertNotIn(b'Grade', pdf_bytes)
+        self.assertNotIn(b'Attendance', pdf_bytes)
+
+    def test_parent_sees_linked_child_results_only(self):
+        self._create_approved_assessment_result()
+        other_parent_user = User.objects.create_user(
+            email='result-other-parent@test.com',
+            password='testpass123',
+            first_name='Other',
+            last_name='Parent',
+            role='parent',
+            approval_status='approved',
+        )
+        other_parent = Parent.objects.create(
+            user=other_parent_user,
+            first_name='Other',
+            last_name='Parent',
+            email='result-other-parent-profile@test.com',
+        )
+        other_student = Student.objects.create(
+            parent=other_parent,
+            first_name='Other',
+            last_name='Child',
+            email='result-other-child@test.com',
+            learner_type='child',
+            approval_status='approved',
+        )
+        other_enrollment = Enrollment.objects.create(
+            student=other_student,
+            course=self.course,
+            instructor=self.instructor,
+            status='completed',
+        )
+        AssessmentResult.objects.create(
+            enrollment=other_enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+        )
+        self.client.force_authenticate(self.parent_user)
+
+        response = self.client.get(reverse('my-assessment-results'))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['student_id'], self.student.id)
+
+    def test_adult_learner_sees_own_result_only(self):
+        self._create_approved_assessment_result()
+        self.client.force_authenticate(self.student_user)
+
+        response = self.client.get(reverse('my-assessment-results'))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['student_id'], self.student.id)
 
     def _response_bytes(self, response):
         if getattr(response, 'streaming', False):
             return b''.join(response.streaming_content)
         return response.content
+
+    def _create_approved_assessment_result(self, enrollment=None):
+        return AssessmentResult.objects.create(
+            enrollment=enrollment or self.enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+            is_approved=True,
+            approved_by=self.admin_user,
+            approved_at=timezone.now(),
+        )
 
     def _create_certificate_with_file(self):
         cert = Certificate.objects.create(
