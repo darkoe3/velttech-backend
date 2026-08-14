@@ -353,6 +353,16 @@ class CertificateEligibilityListView(generics.ListAPIView):
 
     permission_classes = [IsAuthenticated]
     serializer_class = CertificateListSerializer
+    BLOCKER_LABELS = {
+        'assessment_missing': 'Assessment result not created',
+        'assessment_incomplete': 'Assessment incomplete',
+        'result_awaiting_approval': 'Result awaiting approval',
+        'below_pass_mark': 'Below pass mark',
+        'enrollment_incomplete': 'Enrollment incomplete',
+        'payment_outstanding': 'Payment outstanding',
+        'student_not_approved': 'Student not approved',
+        'certificate_already_issued': 'Certificate already issued',
+    }
 
     def get_queryset(self):
         """Get eligible students for course"""
@@ -384,12 +394,11 @@ class CertificateEligibilityListView(generics.ListAPIView):
 
     def list(self, request, *args, **kwargs):
         """Return list of eligible students (not certificates)"""
-        from enrollments.models import Enrollment
-        from students.serializers import StudentSerializer
         from .services import check_combined_result_certificate_eligibility
 
         queryset = self.get_queryset()
         eligible_students = []
+        blocker_counts = {key: 0 for key in self.BLOCKER_LABELS}
 
         for enrollment in queryset:
             eligibility = check_combined_result_certificate_eligibility(enrollment)
@@ -407,8 +416,51 @@ class CertificateEligibilityListView(generics.ListAPIView):
                     'percentage': eligibility['percentage'],
                     'pass_mark': eligibility['pass_mark'],
                 })
+            else:
+                for blocker in self._blockers_for(enrollment, eligibility, result):
+                    blocker_counts[blocker] += 1
 
-        return Response(eligible_students)
+        blockers = [
+            {
+                'code': code,
+                'label': self.BLOCKER_LABELS[code],
+                'count': count,
+            }
+            for code, count in blocker_counts.items()
+            if count
+        ]
+
+        return Response({
+            'eligible_students': eligible_students,
+            'summary': {
+                'examined': queryset.count(),
+                'eligible': len(eligible_students),
+                'ineligible': queryset.count() - len(eligible_students),
+                'total_blockers': sum(item['count'] for item in blockers),
+                'blockers': blockers,
+            },
+        })
+
+    def _blockers_for(self, enrollment, eligibility, result):
+        blockers = []
+        if not eligibility['enrollment_completed']:
+            blockers.append('enrollment_incomplete')
+        if not enrollment.student.approval_status == enrollment.student.STATUS_APPROVED:
+            blockers.append('student_not_approved')
+        if not eligibility['payments_settled']:
+            blockers.append('payment_outstanding')
+        if not result:
+            blockers.append('assessment_missing')
+        else:
+            if not result.is_complete:
+                blockers.append('assessment_incomplete')
+            if result.is_complete and not result.is_approved:
+                blockers.append('result_awaiting_approval')
+            if result.is_complete and result.percentage < enrollment.course.certificate_pass_mark:
+                blockers.append('below_pass_mark')
+        if eligibility['certificate_exists']:
+            blockers.append('certificate_already_issued')
+        return blockers
 
     def _get_student_name(self, student):
         names = [student.first_name, student.other_name, student.last_name]

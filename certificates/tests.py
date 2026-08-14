@@ -766,6 +766,7 @@ class CertificateAPITests(CertificateModelTests):
 
     def test_certificate_pdf_still_excludes_assessment_metrics(self):
         from .pdf_generator import CertificatePDFGenerator
+        from reportlab import rl_config
 
         cert = Certificate.objects.create(
             student=self.student,
@@ -774,17 +775,45 @@ class CertificateAPITests(CertificateModelTests):
             completion_date=date.today(),
             status=Certificate.STATUS_ISSUED,
             issued_by=self.admin_user,
-            final_score=88,
-            final_grade='A',
-            attendance_percentage=100,
+            final_score=Decimal('91.73'),
+            final_grade='Z',
+            attendance_percentage=Decimal('64.29'),
         )
 
-        pdf_bytes = CertificatePDFGenerator(cert).generate_pdf()
+        original_compression = rl_config.pageCompression
+        rl_config.pageCompression = 0
+        try:
+            pdf_bytes = CertificatePDFGenerator(cert).generate_pdf()
+        finally:
+            rl_config.pageCompression = original_compression
 
-        self.assertNotIn(b'88', pdf_bytes)
-        self.assertNotIn(b'100%', pdf_bytes)
-        self.assertNotIn(b'Grade', pdf_bytes)
-        self.assertNotIn(b'Attendance', pdf_bytes)
+        pdf_text = pdf_bytes.decode('latin-1', errors='ignore')
+
+        self.assertIn('STUDENT USER', pdf_text)
+        self.assertIn('Certificate No.', pdf_text)
+        self.assertNotIn('91.73', pdf_text)
+        self.assertNotIn('64.29', pdf_text)
+        self.assertNotIn('Grade', pdf_text)
+        self.assertNotIn('Attendance', pdf_text)
+
+    def test_eligible_endpoint_reports_blocker_summary(self):
+        self.client.force_authenticate(self.admin_user)
+
+        response = self.client.get(reverse('certificate-eligible'), {'course_id': self.course.id})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['eligible_students'], [])
+        self.assertEqual(response.data['summary']['examined'], 1)
+        self.assertEqual(response.data['summary']['eligible'], 0)
+        self.assertEqual(response.data['summary']['ineligible'], 1)
+        self.assertIn(
+            {
+                'code': 'assessment_missing',
+                'label': 'Assessment result not created',
+                'count': 1,
+            },
+            response.data['summary']['blockers'],
+        )
 
     def test_parent_sees_linked_child_results_only(self):
         self._create_approved_assessment_result()

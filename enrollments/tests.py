@@ -1,6 +1,8 @@
 import uuid
+from io import StringIO
 from decimal import Decimal
 
+from django.core.management import call_command
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 from django.contrib.auth import get_user_model
@@ -10,6 +12,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from courses.models import Course
+from certificates.models import Certificate
 from payments.models import Payment
 from students.models import Parent, Student
 
@@ -721,6 +724,92 @@ class InstructorGradingTests(APITestCase):
         response = self.client.get(self.public_assessment_url(self.assignment))
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+@override_settings(SECURE_SSL_REDIRECT=False, MIDDLEWARE=[])
+class ReconcileAssessmentResultsCommandTests(APITestCase):
+    def setUp(self):
+        self.instructor = User.objects.create_user(
+            email='reconcile-instructor@example.com',
+            password='pass',
+            first_name='Recon',
+            last_name='Tutor',
+            role=User.ROLE_INSTRUCTOR,
+            approval_status=User.APPROVAL_APPROVED,
+        )
+        self.student = Student.objects.create(
+            first_name='Historical',
+            last_name='Learner',
+            email='historical-learner@example.com',
+            learner_type=Student.LEARNER_ADULT,
+            approval_status=Student.STATUS_APPROVED,
+        )
+        self.course = Course.objects.create(
+            title='Historical Assessment Course',
+            description='Course with older enrollments',
+            duration_months=2,
+            monthly_fee=100,
+            fee=200,
+            certificate_pass_mark=Decimal('70.00'),
+        )
+        self.enrollment = Enrollment.objects.create(
+            student=self.student,
+            course=self.course,
+            instructor=self.instructor,
+            status=Enrollment.STATUS_COMPLETED,
+        )
+        Payment.objects.create(
+            enrollment=self.enrollment,
+            amount=200,
+            status=Payment.STATUS_PAID,
+        )
+
+    def run_command(self):
+        output = StringIO()
+        call_command('reconcile_assessment_results', stdout=output)
+        return output.getvalue()
+
+    def test_missing_result_is_created_incomplete_and_unapproved(self):
+        output = self.run_command()
+
+        result = AssessmentResult.objects.get(enrollment=self.enrollment)
+        self.assertEqual(result.status, AssessmentResult.STATUS_INCOMPLETE)
+        self.assertFalse(result.is_approved)
+        self.assertIsNone(result.practical_score)
+        self.assertIsNone(result.final_project_score)
+        self.assertIsNone(result.objective_quiz_score)
+        self.assertIn('AssessmentResults created: 1', output)
+
+    def test_existing_result_is_untouched(self):
+        result = AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('31.00'),
+        )
+        original_updated_at = result.updated_at
+
+        output = self.run_command()
+        result.refresh_from_db()
+
+        self.assertEqual(result.practical_score, Decimal('31.00'))
+        self.assertEqual(result.updated_at, original_updated_at)
+        self.assertIn('Already existing: 1', output)
+        self.assertIn('AssessmentResults created: 0', output)
+
+    def test_command_does_not_issue_certificate_or_approve_result(self):
+        self.run_command()
+
+        result = AssessmentResult.objects.get(enrollment=self.enrollment)
+        self.assertFalse(result.is_approved)
+        self.assertEqual(Certificate.objects.count(), 0)
+
+    def test_command_is_safe_to_run_more_than_once(self):
+        first_output = self.run_command()
+        second_output = self.run_command()
+
+        self.assertEqual(AssessmentResult.objects.filter(enrollment=self.enrollment).count(), 1)
+        self.assertIn('AssessmentResults created: 1', first_output)
+        self.assertIn('AssessmentResults created: 0', second_output)
+        self.assertIn('Already existing: 1', second_output)
 
 
 @override_settings(SECURE_SSL_REDIRECT=False, MIDDLEWARE=[])
