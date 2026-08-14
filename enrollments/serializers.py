@@ -376,6 +376,7 @@ class AssessmentResultUpdateSerializer(serializers.ModelSerializer):
         fields = [
             'practical_score',
             'final_project_score',
+            'objective_quiz_score',
             'final_project_feedback',
         ]
 
@@ -390,6 +391,7 @@ class AssessmentResultUpdateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('Approved assessment results cannot be changed by instructors.')
         practical_score = attrs.get('practical_score', instance.practical_score)
         final_project_score = attrs.get('final_project_score', instance.final_project_score)
+        objective_quiz_score = attrs.get('objective_quiz_score', instance.objective_quiz_score)
         if practical_score is not None and practical_score > instance.practical_max_score:
             raise serializers.ValidationError({
                 'practical_score': 'Practical score cannot exceed its maximum score.'
@@ -397,6 +399,10 @@ class AssessmentResultUpdateSerializer(serializers.ModelSerializer):
         if final_project_score is not None and final_project_score > instance.final_project_max_score:
             raise serializers.ValidationError({
                 'final_project_score': 'Final project score cannot exceed its maximum score.'
+            })
+        if objective_quiz_score is not None and objective_quiz_score > instance.objective_quiz_max_score:
+            raise serializers.ValidationError({
+                'objective_quiz_score': f'Objective quiz score cannot exceed {instance.objective_quiz_max_score:g}.'
             })
         return attrs
 

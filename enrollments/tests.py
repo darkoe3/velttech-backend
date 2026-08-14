@@ -13,6 +13,7 @@ from rest_framework.test import APITestCase
 
 from courses.models import Course
 from certificates.models import Certificate
+from certificates.services import check_combined_result_certificate_eligibility
 from payments.models import Payment
 from students.models import Parent, Student
 
@@ -1031,6 +1032,50 @@ class AssessmentResultPhaseOneTests(APITestCase):
         result.refresh_from_db()
         self.assertEqual(result.objective_quiz_score, Decimal('10.00'))
 
+    def test_online_import_requires_confirmation_before_replacing_manual_score(self):
+        result = AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            objective_quiz_score=Decimal('17.00'),
+        )
+        quiz = Assignment.objects.create(
+            title='Objective Quiz',
+            description='Auto graded quiz.',
+            course=self.course,
+            instructor=self.instructor,
+            due_date='2026-08-01',
+            submission_type=Assignment.ASSESSMENT_QUIZ,
+            marks=50,
+        )
+        submission = AssignmentSubmission.objects.create(
+            assignment=quiz,
+            student=self.student,
+            score=25,
+            max_score=50,
+            status=AssignmentSubmission.STATUS_GRADED,
+        )
+        self.client.force_authenticate(self.instructor)
+
+        blocked = self.client.post(
+            self.import_quiz_url(result),
+            {'submission_id': submission.id},
+            format='json',
+        )
+        result.refresh_from_db()
+
+        self.assertEqual(blocked.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(blocked.data['requires_confirmation'])
+        self.assertEqual(result.objective_quiz_score, Decimal('17.00'))
+
+        confirmed = self.client.post(
+            self.import_quiz_url(result),
+            {'submission_id': submission.id, 'replace_existing': True},
+            format='json',
+        )
+        result.refresh_from_db()
+
+        self.assertEqual(confirmed.status_code, status.HTTP_200_OK)
+        self.assertEqual(result.objective_quiz_score, Decimal('10.00'))
+
     def test_instructor_records_practical_score(self):
         result = AssessmentResult.objects.create(enrollment=self.enrollment)
         self.client.force_authenticate(self.instructor)
@@ -1063,6 +1108,142 @@ class AssessmentResultPhaseOneTests(APITestCase):
         self.assertEqual(result.final_project_score, Decimal('34.00'))
         self.assertEqual(result.final_project_feedback, 'Clear project with good documentation.')
 
+    def test_instructor_manually_records_objective_quiz_score(self):
+        result = AssessmentResult.objects.create(enrollment=self.enrollment)
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.patch(
+            self.assessment_result_detail_url(result),
+            {'objective_quiz_score': '17.00'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result.refresh_from_db()
+        self.assertEqual(result.objective_quiz_score, Decimal('17.00'))
+        self.assertEqual(AssignmentSubmission.objects.count(), 0)
+
+    def test_manual_objective_score_rejects_above_maximum(self):
+        result = AssessmentResult.objects.create(enrollment=self.enrollment)
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.patch(
+            self.assessment_result_detail_url(result),
+            {'objective_quiz_score': '21.00'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Objective quiz score cannot exceed 20', str(response.data))
+
+    def test_manual_objective_score_rejects_negative_score(self):
+        result = AssessmentResult.objects.create(enrollment=self.enrollment)
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.patch(
+            self.assessment_result_detail_url(result),
+            {'objective_quiz_score': '-1.00'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('objective_quiz_score', response.data)
+
+    def test_manual_objective_score_updates_overall_and_ready_status(self):
+        result = AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('37.00'),
+        )
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.patch(
+            self.assessment_result_detail_url(result),
+            {'objective_quiz_score': '17.00'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result.refresh_from_db()
+        self.assertEqual(result.overall_score, Decimal('89.00'))
+        self.assertEqual(result.percentage, Decimal('89.00'))
+        self.assertEqual(result.status, AssessmentResult.STATUS_READY_FOR_REVIEW)
+
+    def test_manual_objective_score_contributes_to_certificate_eligibility(self):
+        result = AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('37.00'),
+            objective_quiz_score=Decimal('17.00'),
+        )
+        result.approve(self.instructor)
+
+        eligibility = check_combined_result_certificate_eligibility(self.enrollment)
+
+        self.assertTrue(eligibility['eligible'])
+
+    def test_instructor_can_edit_manual_objective_score_before_approval(self):
+        result = AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            objective_quiz_score=Decimal('15.00'),
+        )
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.patch(
+            self.assessment_result_detail_url(result),
+            {'objective_quiz_score': '18.00'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result.refresh_from_db()
+        self.assertEqual(result.objective_quiz_score, Decimal('18.00'))
+
+    def test_instructor_cannot_edit_manual_objective_score_after_certificate_issuance(self):
+        result = AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('37.00'),
+            objective_quiz_score=Decimal('17.00'),
+            is_approved=True,
+            approved_by=self.admin,
+            approved_at=timezone.now(),
+        )
+        Certificate.objects.create(
+            student=self.student,
+            enrollment=self.enrollment,
+            course=self.course,
+            completion_date=timezone.localdate(),
+            status=Certificate.STATUS_ACTIVE,
+            issued_by=self.admin,
+        )
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.patch(
+            self.assessment_result_detail_url(result),
+            {'objective_quiz_score': '18.00'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        result.refresh_from_db()
+        self.assertEqual(result.objective_quiz_score, Decimal('17.00'))
+
+    def test_historical_reconciled_result_accepts_manual_objective_score(self):
+        call_command('reconcile_assessment_results', stdout=StringIO())
+        result = AssessmentResult.objects.get(enrollment=self.enrollment)
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.patch(
+            self.assessment_result_detail_url(result),
+            {'objective_quiz_score': '16.00'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result.refresh_from_db()
+        self.assertEqual(result.objective_quiz_score, Decimal('16.00'))
+
     def test_invalid_component_score_is_rejected_by_api(self):
         result = AssessmentResult.objects.create(enrollment=self.enrollment)
         self.client.force_authenticate(self.instructor)
@@ -1091,6 +1272,27 @@ class AssessmentResultPhaseOneTests(APITestCase):
         response = self.client.patch(
             self.assessment_result_detail_url(result),
             {'practical_score': '36.00'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Approved assessment results cannot be changed by instructors.', str(response.data))
+
+    def test_instructor_cannot_edit_manual_objective_score_after_approval(self):
+        result = AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('37.00'),
+            objective_quiz_score=Decimal('17.00'),
+            is_approved=True,
+            approved_by=self.admin,
+            approved_at=timezone.now(),
+        )
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.patch(
+            self.assessment_result_detail_url(result),
+            {'objective_quiz_score': '18.00'},
             format='json',
         )
 

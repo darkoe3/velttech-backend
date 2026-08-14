@@ -1802,6 +1802,15 @@ class InstructorAssessmentResultImportQuizScoreView(APIView):
             raise ValidationError({'detail': 'Certified assessment results cannot be changed.'})
         if result.is_approved and request.user.role != User.ROLE_ADMIN:
             raise ValidationError({'detail': 'Approved assessment results cannot be changed by instructors.'})
+        replace_existing = bool(request.data.get('replace_existing'))
+        if result.objective_quiz_score is not None and not replace_existing:
+            raise ValidationError({
+                'detail': (
+                    f'An objective score of {result.objective_quiz_score}/{result.objective_quiz_max_score} '
+                    'already exists. Confirm replacement before importing an online quiz score.'
+                ),
+                'requires_confirmation': True,
+            })
         serializer = AssessmentResultImportQuizSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
