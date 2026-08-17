@@ -1108,6 +1108,31 @@ class AssessmentResultPhaseOneTests(APITestCase):
         self.assertEqual(result.final_project_score, Decimal('34.00'))
         self.assertEqual(result.final_project_feedback, 'Clear project with good documentation.')
 
+    def test_instructor_records_all_component_scores_in_one_patch(self):
+        result = AssessmentResult.objects.create(enrollment=self.enrollment)
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.patch(
+            self.assessment_result_detail_url(result),
+            {
+                'practical_score': '35.00',
+                'final_project_score': '30.00',
+                'objective_quiz_score': '18.00',
+                'final_project_feedback': 'Strong project delivery.',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result.refresh_from_db()
+        self.assertEqual(result.practical_score, Decimal('35.00'))
+        self.assertEqual(result.final_project_score, Decimal('30.00'))
+        self.assertEqual(result.objective_quiz_score, Decimal('18.00'))
+        self.assertEqual(result.final_project_feedback, 'Strong project delivery.')
+        self.assertEqual(result.overall_score, Decimal('83.00'))
+        self.assertEqual(result.percentage, Decimal('83.00'))
+        self.assertEqual(result.status, AssessmentResult.STATUS_READY_FOR_REVIEW)
+
     def test_instructor_manually_records_objective_quiz_score(self):
         result = AssessmentResult.objects.create(enrollment=self.enrollment)
         self.client.force_authenticate(self.instructor)
