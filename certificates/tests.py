@@ -295,7 +295,50 @@ class CertificateModelTests(TestCase):
 
         self.assertFalse(eligibility['eligible'])
         self.assertTrue(eligibility['certificate_exists'])
-        self.assertIn('A valid certificate already exists for this enrollment.', eligibility['reasons'])
+        self.assertIn('Certificate already issued.', eligibility['reasons'])
+
+    def test_revoked_certificate_blocks_new_issue_and_recommends_reissue(self):
+        AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+            is_approved=True,
+            approved_by=self.admin_user,
+            approved_at=timezone.now(),
+        )
+        certificate = Certificate.objects.create(
+            student=self.student,
+            enrollment=self.enrollment,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_REVOKED,
+            issued_by=self.admin_user,
+        )
+
+        eligibility = check_combined_result_certificate_eligibility(self.enrollment)
+
+        self.assertFalse(eligibility['eligible'])
+        self.assertFalse(eligibility['certificate_exists'])
+        self.assertTrue(eligibility['certificate_revoked'])
+        self.assertEqual(eligibility['certificate_id'], certificate.id)
+        self.assertEqual(eligibility['certificate_number'], certificate.certificate_number)
+        self.assertEqual(eligibility['certificate_status'], Certificate.STATUS_REVOKED)
+        self.assertEqual(eligibility['recommended_action'], 'reissue')
+        self.assertIn('Certificate revoked — use Reissue.', eligibility['reasons'])
+
+    def test_missing_score_components_are_reported_separately(self):
+        AssessmentResult.objects.create(
+            enrollment=self.enrollment,
+            final_project_score=Decimal('30.00'),
+        )
+
+        eligibility = check_combined_result_certificate_eligibility(self.enrollment)
+
+        self.assertFalse(eligibility['eligible'])
+        self.assertIn('Practical score missing.', eligibility['reasons'])
+        self.assertIn('Objective Quiz score missing.', eligibility['reasons'])
+        self.assertNotIn('Final Project score missing.', eligibility['reasons'])
 
 
 @override_settings(
@@ -346,6 +389,40 @@ class CertificateAPITests(CertificateModelTests):
             title='Certificate Issued',
             message='A certificate has been issued for Student User.',
         ).exists())
+
+    @patch('certificates.pdf_generator.CertificatePDFGenerator')
+    def test_assigned_instructor_issues_eligible_certificate(self, generator_cls):
+        def save_generated_pdf():
+            certificate = Certificate.objects.get()
+            certificate.pdf_file.save(
+                f'{certificate.certificate_number}.pdf',
+                ContentFile(b'%PDF-1.4 instructor certificate'),
+                save=True,
+            )
+
+        generator_cls.return_value.save_to_certificate.side_effect = save_generated_pdf
+        assessment_result = self._create_approved_assessment_result(approved_by=self.instructor)
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.post(reverse('certificate-issue'), {
+            'enrollment_id': self.enrollment.id,
+            'assessment_result_id': assessment_result.id,
+            'completion_date': date.today().isoformat(),
+        }, format='json')
+        duplicate_response = self.client.post(reverse('certificate-issue'), {
+            'enrollment_id': self.enrollment.id,
+            'assessment_result_id': assessment_result.id,
+            'completion_date': date.today().isoformat(),
+        }, format='json')
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(duplicate_response.status_code, 400)
+        certificate = Certificate.objects.get(enrollment=self.enrollment)
+        self.assertEqual(certificate.issued_by, self.instructor)
+        self.assertTrue(certificate.pdf_file.storage.exists(certificate.pdf_file.name))
+        self.assertEqual(Certificate.objects.count(), 1)
+        assessment_result.refresh_from_db()
+        self.assertEqual(assessment_result.status, AssessmentResult.STATUS_CERTIFICATE_ISSUED)
 
     @patch('certificates.pdf_generator.CertificatePDFGenerator')
     def test_adult_learner_receives_certificate_notification(self, generator_cls):
@@ -468,6 +545,45 @@ class CertificateAPITests(CertificateModelTests):
 
         self.assertEqual(response.status_code, 403)
 
+    def test_instructor_cannot_issue_ineligible_certificate(self):
+        self._create_approved_assessment_result()
+        self.payment.status = Payment.STATUS_PENDING
+        self.payment.save(update_fields=['status'])
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.post(reverse('certificate-issue'), {
+            'enrollment_id': self.enrollment.id,
+            'completion_date': date.today().isoformat(),
+        }, format='json')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('Payments are not settled.', response.data['reasons'])
+        self.assertEqual(Certificate.objects.count(), 0)
+
+    def test_parent_cannot_issue_certificate(self):
+        self._create_approved_assessment_result()
+        self.client.force_authenticate(self.parent_user)
+
+        response = self.client.post(reverse('certificate-issue'), {
+            'enrollment_id': self.enrollment.id,
+            'completion_date': date.today().isoformat(),
+        }, format='json')
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(Certificate.objects.count(), 0)
+
+    def test_student_cannot_issue_certificate(self):
+        self._create_approved_assessment_result()
+        self.client.force_authenticate(self.student_user)
+
+        response = self.client.post(reverse('certificate-issue'), {
+            'enrollment_id': self.enrollment.id,
+            'completion_date': date.today().isoformat(),
+        }, format='json')
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(Certificate.objects.count(), 0)
+
     @patch('certificates.pdf_generator.CertificatePDFGenerator')
     def test_duplicate_certificate_is_blocked(self, generator_cls):
         generator_cls.return_value.save_to_certificate.return_value = None
@@ -483,6 +599,61 @@ class CertificateAPITests(CertificateModelTests):
 
         self.assertEqual(first.status_code, 201)
         self.assertEqual(second.status_code, 400)
+
+    def test_revoked_certificate_is_not_offered_for_new_issuance(self):
+        self._create_approved_assessment_result()
+        certificate = Certificate.objects.create(
+            student=self.student,
+            enrollment=self.enrollment,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_REVOKED,
+            issued_by=self.admin_user,
+        )
+        self.client.force_authenticate(self.admin_user)
+
+        eligible_response = self.client.get(reverse('certificate-eligible'), {'course_id': self.course.id})
+        issue_response = self.client.post(reverse('certificate-issue'), {
+            'enrollment_id': self.enrollment.id,
+            'completion_date': date.today().isoformat(),
+        }, format='json')
+
+        self.assertEqual(eligible_response.status_code, 200)
+        self.assertEqual(eligible_response.data['eligible_students'], [])
+        self.assertIn(
+            {
+                'code': 'certificate_revoked',
+                'label': 'Certificate revoked — use Reissue',
+                'count': 1,
+            },
+            eligible_response.data['summary']['blockers'],
+        )
+        self.assertEqual(issue_response.status_code, 400)
+        self.assertIn('Certificate revoked — use Reissue.', issue_response.data['reasons'])
+        self.assertEqual(Certificate.objects.count(), 1)
+        self.assertEqual(Certificate.objects.get().id, certificate.id)
+
+    @patch('certificates.pdf_generator.CertificatePDFGenerator')
+    def test_revoked_certificate_can_still_use_existing_reissue(self, generator_cls):
+        generator_cls.return_value.save_to_certificate.return_value = None
+        certificate = Certificate.objects.create(
+            student=self.student,
+            enrollment=self.enrollment,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_REVOKED,
+            issued_by=self.admin_user,
+        )
+        certificate_number = certificate.certificate_number
+        self.client.force_authenticate(self.admin_user)
+
+        response = self.client.post(reverse('certificate-reissue', args=[certificate.id]))
+
+        self.assertEqual(response.status_code, 200)
+        certificate.refresh_from_db()
+        self.assertEqual(Certificate.objects.count(), 1)
+        self.assertEqual(certificate.certificate_number, certificate_number)
+        self.assertEqual(certificate.status, Certificate.STATUS_ACTIVE)
 
     @patch('certificates.pdf_generator.CertificatePDFGenerator')
     def test_result_status_becomes_certificate_issued_after_issue(self, generator_cls):
@@ -513,7 +684,7 @@ class CertificateAPITests(CertificateModelTests):
         }, format='json')
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn('Combined assessment result is incomplete.', response.data['reasons'])
+        self.assertIn('Practical score missing.', response.data['reasons'])
 
     def test_unapproved_result_cannot_issue_certificate(self):
         self.assessment_result = self._create_approved_assessment_result()
@@ -815,6 +986,176 @@ class CertificateAPITests(CertificateModelTests):
             response.data['summary']['blockers'],
         )
 
+    def test_eligible_endpoint_reports_each_assessment_and_certificate_blocker(self):
+        def create_enrollment(label, enrollment_status=Enrollment.STATUS_COMPLETED, payment_status=Payment.STATUS_PAID, student_status=Student.STATUS_APPROVED):
+            student = Student.objects.create(
+                first_name=label,
+                last_name='Learner',
+                email=f'{label.lower()}@test.com',
+                learner_type=Student.LEARNER_ADULT,
+                approval_status=student_status,
+            )
+            enrollment = Enrollment.objects.create(
+                student=student,
+                course=self.course,
+                instructor=self.instructor,
+                status=enrollment_status,
+            )
+            Payment.objects.create(
+                enrollment=enrollment,
+                amount=300.00,
+                status=payment_status,
+            )
+            return enrollment
+
+        active_enrollment = create_enrollment('Active', enrollment_status=Enrollment.STATUS_ACTIVE)
+        AssessmentResult.objects.create(
+            enrollment=active_enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+            is_approved=True,
+            approved_by=self.admin_user,
+            approved_at=timezone.now(),
+        )
+
+        payment_enrollment = create_enrollment('Payment', payment_status=Payment.STATUS_PENDING)
+        AssessmentResult.objects.create(
+            enrollment=payment_enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+            is_approved=True,
+            approved_by=self.admin_user,
+            approved_at=timezone.now(),
+        )
+
+        practical_missing = create_enrollment('PracticalMissing')
+        AssessmentResult.objects.create(
+            enrollment=practical_missing,
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+        )
+
+        final_project_missing = create_enrollment('FinalProjectMissing')
+        AssessmentResult.objects.create(
+            enrollment=final_project_missing,
+            practical_score=Decimal('35.00'),
+            objective_quiz_score=Decimal('15.00'),
+        )
+
+        objective_missing = create_enrollment('ObjectiveMissing')
+        AssessmentResult.objects.create(
+            enrollment=objective_missing,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+        )
+
+        unapproved = create_enrollment('Unapproved')
+        AssessmentResult.objects.create(
+            enrollment=unapproved,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+        )
+
+        below_pass = create_enrollment('BelowPass')
+        AssessmentResult.objects.create(
+            enrollment=below_pass,
+            practical_score=Decimal('20.00'),
+            final_project_score=Decimal('20.00'),
+            objective_quiz_score=Decimal('10.00'),
+        )
+
+        active_certificate = create_enrollment('ActiveCertificate')
+        AssessmentResult.objects.create(
+            enrollment=active_certificate,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+            is_approved=True,
+            approved_by=self.admin_user,
+            approved_at=timezone.now(),
+        )
+        Certificate.objects.create(
+            student=active_certificate.student,
+            enrollment=active_certificate,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_ACTIVE,
+            issued_by=self.admin_user,
+        )
+
+        revoked_certificate = create_enrollment('RevokedCertificate')
+        AssessmentResult.objects.create(
+            enrollment=revoked_certificate,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+            is_approved=True,
+            approved_by=self.admin_user,
+            approved_at=timezone.now(),
+        )
+        Certificate.objects.create(
+            student=revoked_certificate.student,
+            enrollment=revoked_certificate,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_REVOKED,
+            issued_by=self.admin_user,
+        )
+
+        pending_student = create_enrollment('PendingStudent', student_status=Student.STATUS_PENDING)
+        AssessmentResult.objects.create(
+            enrollment=pending_student,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+            is_approved=True,
+            approved_by=self.admin_user,
+            approved_at=timezone.now(),
+        )
+
+        self.client.force_authenticate(self.admin_user)
+        response = self.client.get(reverse('certificate-eligible'), {'course_id': self.course.id})
+
+        self.assertEqual(response.status_code, 200)
+        blocker_codes = {item['code'] for item in response.data['summary']['blockers']}
+        self.assertTrue({
+            'assessment_missing',
+            'enrollment_incomplete',
+            'payment_outstanding',
+            'practical_score_missing',
+            'final_project_score_missing',
+            'objective_quiz_score_missing',
+            'result_awaiting_approval',
+            'below_pass_mark',
+            'certificate_already_issued',
+            'certificate_revoked',
+            'student_not_approved',
+        }.issubset(blocker_codes))
+
+    def test_instructor_eligible_endpoint_counts_only_assigned_enrollments(self):
+        other_student = Student.objects.create(
+            first_name='Other',
+            last_name='Learner',
+            email='other-scope@test.com',
+            learner_type=Student.LEARNER_ADULT,
+            approval_status=Student.STATUS_APPROVED,
+        )
+        Enrollment.objects.create(
+            student=other_student,
+            course=self.course,
+            instructor=self.other_instructor,
+            status=Enrollment.STATUS_COMPLETED,
+        )
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.get(reverse('certificate-eligible'), {'course_id': self.course.id})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['summary']['examined'], 1)
+
     def test_parent_sees_linked_child_results_only(self):
         self._create_approved_assessment_result()
         other_parent_user = User.objects.create_user(
@@ -874,14 +1215,14 @@ class CertificateAPITests(CertificateModelTests):
             return b''.join(response.streaming_content)
         return response.content
 
-    def _create_approved_assessment_result(self, enrollment=None):
+    def _create_approved_assessment_result(self, enrollment=None, approved_by=None):
         return AssessmentResult.objects.create(
             enrollment=enrollment or self.enrollment,
             practical_score=Decimal('35.00'),
             final_project_score=Decimal('30.00'),
             objective_quiz_score=Decimal('15.00'),
             is_approved=True,
-            approved_by=self.admin_user,
+            approved_by=approved_by or self.admin_user,
             approved_at=timezone.now(),
         )
 

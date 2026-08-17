@@ -355,13 +355,16 @@ class CertificateEligibilityListView(generics.ListAPIView):
     serializer_class = CertificateListSerializer
     BLOCKER_LABELS = {
         'assessment_missing': 'Assessment result not created',
-        'assessment_incomplete': 'Assessment incomplete',
+        'practical_score_missing': 'Practical score missing',
+        'final_project_score_missing': 'Final Project score missing',
+        'objective_quiz_score_missing': 'Objective Quiz score missing',
         'result_awaiting_approval': 'Result awaiting approval',
         'below_pass_mark': 'Below pass mark',
         'enrollment_incomplete': 'Enrollment incomplete',
         'payment_outstanding': 'Payment outstanding',
         'student_not_approved': 'Student not approved',
         'certificate_already_issued': 'Certificate already issued',
+        'certificate_revoked': 'Certificate revoked — use Reissue',
     }
 
     def get_queryset(self):
@@ -374,21 +377,19 @@ class CertificateEligibilityListView(generics.ListAPIView):
         if not course_id:
             return Certificate.objects.none()
 
-        # Get all completed enrollments for the course
-        completed_enrollments = Enrollment.objects.select_related(
+        enrollments = Enrollment.objects.select_related(
             'student',
             'course',
             'instructor',
         ).filter(
             course_id=course_id,
-            status=Enrollment.STATUS_COMPLETED,
         )
 
         # Filter by user role
         if user.role == 'admin':
-            return completed_enrollments
+            return enrollments
         elif user.role == 'instructor':
-            return completed_enrollments.filter(instructor=user)
+            return enrollments.filter(instructor=user)
         else:
             return Enrollment.objects.none()
 
@@ -415,6 +416,10 @@ class CertificateEligibilityListView(generics.ListAPIView):
                     'course_title': enrollment.course.title,
                     'percentage': eligibility['percentage'],
                     'pass_mark': eligibility['pass_mark'],
+                    'certificate_id': eligibility['certificate_id'],
+                    'certificate_number': eligibility['certificate_number'],
+                    'certificate_status': eligibility['certificate_status'],
+                    'recommended_action': eligibility['recommended_action'],
                 })
             else:
                 for blocker in self._blockers_for(enrollment, eligibility, result):
@@ -452,14 +457,20 @@ class CertificateEligibilityListView(generics.ListAPIView):
         if not result:
             blockers.append('assessment_missing')
         else:
-            if not result.is_complete:
-                blockers.append('assessment_incomplete')
+            if result.practical_score is None:
+                blockers.append('practical_score_missing')
+            if result.final_project_score is None:
+                blockers.append('final_project_score_missing')
+            if result.objective_quiz_score is None:
+                blockers.append('objective_quiz_score_missing')
             if result.is_complete and not result.is_approved:
                 blockers.append('result_awaiting_approval')
             if result.is_complete and result.percentage < enrollment.course.certificate_pass_mark:
                 blockers.append('below_pass_mark')
         if eligibility['certificate_exists']:
             blockers.append('certificate_already_issued')
+        if eligibility['certificate_revoked']:
+            blockers.append('certificate_revoked')
         return blockers
 
     def _get_student_name(self, student):

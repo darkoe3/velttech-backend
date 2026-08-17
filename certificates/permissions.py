@@ -4,7 +4,8 @@ from rest_framework.permissions import BasePermission
 class CanIssueCertificate(BasePermission):
     """
     Allow admin to issue any certificate.
-    Allow instructors only when explicitly granted the Django add permission.
+    Allow instructors to attempt issuance; enrollment scope and eligibility are
+    enforced by the issuance serializer.
     """
 
     def has_permission(self, request, view):
@@ -15,7 +16,7 @@ class CanIssueCertificate(BasePermission):
         if request.user.role == 'admin':
             return True
 
-        if request.user.role == 'instructor' and request.user.has_perm('certificates.add_certificate'):
+        if request.user.role == 'instructor':
             return True
 
         return False

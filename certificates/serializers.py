@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from django.db.models import Q
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
 from django.utils import timezone
 
 from .models import Certificate
@@ -202,17 +203,6 @@ class CertificateIssuanceSerializer(serializers.Serializer):
         except Enrollment.DoesNotExist:
             raise serializers.ValidationError("Enrollment not found.")
 
-        existing_cert = Certificate.objects.filter(
-            student=enrollment.student,
-            course=enrollment.course,
-            status__in=[Certificate.STATUS_ACTIVE, Certificate.STATUS_LEGACY_ISSUED],
-        ).exists()
-
-        if existing_cert:
-            raise serializers.ValidationError(
-                "A certificate already exists for this student and course."
-            )
-
         return value
 
     def validate(self, data):
@@ -221,7 +211,7 @@ class CertificateIssuanceSerializer(serializers.Serializer):
         result = getattr(enrollment, 'assessment_result', None)
 
         if request and request.user.role == 'instructor' and enrollment.instructor_id != request.user.id:
-            raise serializers.ValidationError(
+            raise PermissionDenied(
                 "You can only issue certificates for your assigned learners."
             )
 
