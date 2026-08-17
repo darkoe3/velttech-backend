@@ -105,12 +105,6 @@ class Certificate(models.Model):
 
     class Meta:
         ordering = ['-created_at']
-        constraints = [
-            models.UniqueConstraint(
-                fields=['student', 'course'],
-                name='unique_student_course_certificate',
-            ),
-        ]
 
     def __str__(self):
         return f'{self.certificate_number} - {self.student}'
@@ -235,4 +229,4 @@ class CertificateBranding(models.Model):
 
     @classmethod
     def current(cls):
-        return cls.objects.order_by('pk').first()
+        return cls.objects.order_by('-updated_at', '-pk').first()

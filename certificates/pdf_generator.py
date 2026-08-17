@@ -1,4 +1,5 @@
 import tempfile
+import logging
 from io import BytesIO
 from pathlib import Path
 
@@ -14,6 +15,7 @@ GREEN = '#7AC943'
 TECH_BLUE = '#9CCED9'
 DARK = '#0F172A'
 PROGRAMME_NAME = 'Young Innovators Academy'
+logger = logging.getLogger(__name__)
 
 
 class CertificatePDFGenerator:
@@ -60,7 +62,7 @@ class CertificatePDFGenerator:
         self._draw_double_border(pdf, page_width, page_height, gold)
 
         branding = CertificateBranding.current()
-        logo_path = self._academy_logo_path(branding)
+        logo_path = self._academy_logo_source(branding)
         logo_drawn = False
         if logo_path:
             logo_drawn = self._draw_image_fit(
@@ -149,7 +151,10 @@ class CertificatePDFGenerator:
         pdf.setFont('Helvetica-Oblique', 9)
         pdf.drawCentredString(page_width / 2, 1.47 * inch, f'Verify online: {verification_url}')
 
-        director_signature_path = self._file_field_path(getattr(branding, 'director_signature', None))
+        director_signature_path = self._file_field_image_source(
+            getattr(branding, 'director_signature', None),
+            'Academy Director signature',
+        )
         self._draw_signature_block(
             pdf,
             1.35 * inch,
@@ -273,8 +278,11 @@ class CertificatePDFGenerator:
         for index, line in enumerate(lines):
             pdf.drawCentredString(center_x, start_y - (index * line_height), line)
 
-    def _academy_logo_path(self, branding):
-        configured_logo = self._file_field_path(getattr(branding, 'academy_logo', None))
+    def _academy_logo_source(self, branding):
+        configured_logo = self._file_field_image_source(
+            getattr(branding, 'academy_logo', None),
+            'Academy logo',
+        )
         if configured_logo:
             return configured_logo
 
@@ -283,20 +291,25 @@ class CertificatePDFGenerator:
             return str(public_logo)
         return None
 
-    def _file_field_path(self, field_file):
-        if not field_file:
+    def _file_field_image_source(self, field_file, label):
+        if not field_file or not getattr(field_file, 'name', ''):
             return None
-        try:
-            path = field_file.path
-        except (NotImplementedError, ValueError, AttributeError):
-            return None
-        return path if path and Path(path).exists() else None
 
-    def _draw_image_fit(self, pdf, image_path, x, y, max_width, max_height):
+        try:
+            if not field_file.storage.exists(field_file.name):
+                logger.warning('%s file is configured but missing from storage: %s', label, field_file.name)
+                return None
+            with field_file.open('rb') as image_file:
+                return BytesIO(image_file.read())
+        except Exception:
+            logger.warning('Could not read %s file from storage: %s', label, field_file.name, exc_info=True)
+            return None
+
+    def _draw_image_fit(self, pdf, image_source, x, y, max_width, max_height):
         try:
             from reportlab.lib.utils import ImageReader
 
-            image = ImageReader(image_path)
+            image = ImageReader(image_source)
             image_width, image_height = image.getSize()
             scale = min(max_width / image_width, max_height / image_height)
             width = image_width * scale
@@ -314,13 +327,13 @@ class CertificatePDFGenerator:
         except Exception:
             return False
 
-    def _draw_signature_block(self, pdf, x, line_y, width, label, sublabel, signature_path, color):
+    def _draw_signature_block(self, pdf, x, line_y, width, label, sublabel, signature_source, color):
         from reportlab.lib.units import inch
 
-        if signature_path:
+        if signature_source:
             self._draw_image_fit(
                 pdf,
-                signature_path,
+                signature_source,
                 x + 0.15 * inch,
                 line_y + 0.08 * inch,
                 width - 0.3 * inch,

@@ -7,6 +7,7 @@ from django.utils import timezone
 from datetime import date
 from decimal import Decimal
 from unittest.mock import patch
+import base64
 
 from rest_framework.test import APIClient
 
@@ -16,10 +17,13 @@ from enrollments.models import Assignment, AssignmentSubmission, AssessmentResul
 from payments.models import Payment
 from users.models import ActivityLog
 from notifications.models import Notification
-from .models import Certificate
+from .models import Certificate, CertificateBranding
 from .services import check_combined_result_certificate_eligibility
 
 User = get_user_model()
+TINY_PNG = base64.b64decode(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lxJd4wAAAABJRU5ErkJggg=='
+)
 
 
 class CertificateModelTests(TestCase):
@@ -128,7 +132,7 @@ class CertificateModelTests(TestCase):
         self.assertIsNotNone(cert.issue_date)
 
     def test_duplicate_issued_certificate_is_blocked(self):
-        """Test that certificate numbers are unique"""
+        """Test that a second certificate cannot be created for the same enrollment"""
         cert1 = Certificate.objects.create(
             student=self.student,
             enrollment=self.enrollment,
@@ -147,6 +151,12 @@ class CertificateModelTests(TestCase):
                 status=Certificate.STATUS_ISSUED,
                 issued_by=self.admin_user,
             )
+
+    def test_certificate_uniqueness_is_per_enrollment_not_student_course(self):
+        constraint_names = {constraint.name for constraint in Certificate._meta.constraints}
+
+        self.assertNotIn('unique_student_course_certificate', constraint_names)
+        self.assertTrue(Certificate._meta.get_field('enrollment').one_to_one)
 
     def test_eligibility_check(self):
         """Test certificate eligibility check"""
@@ -340,6 +350,125 @@ class CertificateModelTests(TestCase):
         self.assertIn('Objective Quiz score missing.', eligibility['reasons'])
         self.assertNotIn('Final Project score missing.', eligibility['reasons'])
 
+    def test_certificate_from_another_enrollment_does_not_block_eligibility(self):
+        Certificate.objects.create(
+            student=self.student,
+            enrollment=self.enrollment,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_ACTIVE,
+            issued_by=self.admin_user,
+        )
+        second_course = Course.objects.create(
+            title='Second Course',
+            description='Another test course',
+            duration_months=2,
+            monthly_fee=150.00,
+        )
+        second_enrollment = Enrollment.objects.create(
+            student=self.student,
+            course=second_course,
+            instructor=self.instructor,
+            status=Enrollment.STATUS_COMPLETED,
+        )
+        Payment.objects.create(
+            enrollment=second_enrollment,
+            amount=300.00,
+            status=Payment.STATUS_PAID,
+        )
+        AssessmentResult.objects.create(
+            enrollment=second_enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+            is_approved=True,
+            approved_by=self.admin_user,
+            approved_at=timezone.now(),
+        )
+
+        eligibility = check_combined_result_certificate_eligibility(second_enrollment)
+
+        self.assertTrue(eligibility['eligible'])
+        self.assertFalse(eligibility['certificate_exists'])
+        self.assertEqual(eligibility['reasons'], [])
+
+    def test_current_branding_uses_latest_record(self):
+        older_branding = CertificateBranding.objects.create()
+        newer_branding = CertificateBranding.objects.create()
+
+        self.assertEqual(CertificateBranding.current(), newer_branding)
+        self.assertNotEqual(CertificateBranding.current(), older_branding)
+
+    def test_director_signature_is_loaded_from_storage_for_pdf_generation(self):
+        from .pdf_generator import CertificatePDFGenerator
+
+        branding = CertificateBranding.objects.create()
+        branding.director_signature.save('director.png', ContentFile(TINY_PNG), save=True)
+        cert = Certificate.objects.create(
+            student=self.student,
+            enrollment=self.enrollment,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_ISSUED,
+            issued_by=self.admin_user,
+        )
+
+        with patch.object(CertificatePDFGenerator, '_draw_signature_block', autospec=True) as signature_block:
+            pdf_bytes = CertificatePDFGenerator(cert).generate_pdf()
+
+        self.assertTrue(pdf_bytes.startswith(b'%PDF'))
+        signature_block.assert_called_once()
+        args = signature_block.call_args.args
+        self.assertEqual(args[5], 'Academy Director')
+        self.assertEqual(args[6], 'Velttech Academy')
+        self.assertIsNotNone(args[7])
+        self.assertNotIn('Instructor', [args[5], args[6]])
+
+    def test_missing_director_signature_file_falls_back_without_crashing(self):
+        from .pdf_generator import CertificatePDFGenerator
+
+        branding = CertificateBranding.objects.create()
+        branding.director_signature.save('missing-director.png', ContentFile(TINY_PNG), save=True)
+        missing_name = branding.director_signature.name
+        branding.director_signature.storage.delete(missing_name)
+        cert = Certificate.objects.create(
+            student=self.student,
+            enrollment=self.enrollment,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_ISSUED,
+            issued_by=self.admin_user,
+        )
+
+        with self.assertLogs('certificates.pdf_generator', level='WARNING') as logs:
+            pdf_bytes = CertificatePDFGenerator(cert).generate_pdf()
+
+        self.assertTrue(pdf_bytes.startswith(b'%PDF'))
+        self.assertTrue(any('missing from storage' in message for message in logs.output))
+
+    def test_no_director_signature_configured_uses_fallback_label(self):
+        from .pdf_generator import CertificatePDFGenerator
+        from reportlab import rl_config
+
+        CertificateBranding.objects.create()
+        cert = Certificate.objects.create(
+            student=self.student,
+            enrollment=self.enrollment,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_ISSUED,
+            issued_by=self.admin_user,
+        )
+
+        original_compression = rl_config.pageCompression
+        rl_config.pageCompression = 0
+        try:
+            pdf_bytes = CertificatePDFGenerator(cert).generate_pdf()
+        finally:
+            rl_config.pageCompression = original_compression
+
+        self.assertIn('Academy Director', pdf_bytes.decode('latin-1', errors='ignore'))
+
 
 @override_settings(
     MIDDLEWARE=[],
@@ -423,6 +552,110 @@ class CertificateAPITests(CertificateModelTests):
         self.assertEqual(Certificate.objects.count(), 1)
         assessment_result.refresh_from_db()
         self.assertEqual(assessment_result.status, AssessmentResult.STATUS_CERTIFICATE_ISSUED)
+
+    @patch('certificates.pdf_generator.CertificatePDFGenerator')
+    def test_same_learner_can_receive_certificates_for_multiple_course_enrollments(self, generator_cls):
+        generator_cls.return_value.save_to_certificate.return_value = None
+        first_result = self._create_approved_assessment_result()
+
+        def create_ready_enrollment(course_title):
+            course = Course.objects.create(
+                title=course_title,
+                description=f'{course_title} description',
+                duration_months=2,
+                monthly_fee=150.00,
+            )
+            enrollment = Enrollment.objects.create(
+                student=self.student,
+                course=course,
+                instructor=self.instructor,
+                status=Enrollment.STATUS_COMPLETED,
+            )
+            Payment.objects.create(
+                enrollment=enrollment,
+                amount=300.00,
+                status=Payment.STATUS_PAID,
+            )
+            AssessmentResult.objects.create(
+                enrollment=enrollment,
+                practical_score=Decimal('35.00'),
+                final_project_score=Decimal('30.00'),
+                objective_quiz_score=Decimal('15.00'),
+                is_approved=True,
+                approved_by=self.admin_user,
+                approved_at=timezone.now(),
+            )
+            return enrollment
+
+        second_enrollment = create_ready_enrollment('Second Certificate Course')
+        third_enrollment = create_ready_enrollment('Third Certificate Course')
+        self.client.force_authenticate(self.admin_user)
+
+        responses = [
+            self.client.post(reverse('certificate-issue'), {
+                'enrollment_id': enrollment.id,
+                'assessment_result_id': getattr(enrollment, 'assessment_result', first_result).id,
+                'completion_date': date.today().isoformat(),
+            }, format='json')
+            for enrollment in [self.enrollment, second_enrollment, third_enrollment]
+        ]
+
+        self.assertEqual([response.status_code for response in responses], [201, 201, 201])
+        self.assertEqual(Certificate.objects.count(), 3)
+        self.assertEqual(
+            set(Certificate.objects.values_list('enrollment_id', flat=True)),
+            {self.enrollment.id, second_enrollment.id, third_enrollment.id},
+        )
+
+    @patch('certificates.pdf_generator.CertificatePDFGenerator')
+    def test_existing_certificate_from_another_enrollment_does_not_block_instructor_issue(self, generator_cls):
+        generator_cls.return_value.save_to_certificate.return_value = None
+        self._create_approved_assessment_result()
+        Certificate.objects.create(
+            student=self.student,
+            enrollment=self.enrollment,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_ACTIVE,
+            issued_by=self.admin_user,
+        )
+        next_course = Course.objects.create(
+            title='Instructor Second Certificate Course',
+            description='Second course',
+            duration_months=2,
+            monthly_fee=150.00,
+        )
+        next_enrollment = Enrollment.objects.create(
+            student=self.student,
+            course=next_course,
+            instructor=self.instructor,
+            status=Enrollment.STATUS_COMPLETED,
+        )
+        Payment.objects.create(
+            enrollment=next_enrollment,
+            amount=300.00,
+            status=Payment.STATUS_PAID,
+        )
+        next_result = AssessmentResult.objects.create(
+            enrollment=next_enrollment,
+            practical_score=Decimal('35.00'),
+            final_project_score=Decimal('30.00'),
+            objective_quiz_score=Decimal('15.00'),
+            is_approved=True,
+            approved_by=self.instructor,
+            approved_at=timezone.now(),
+        )
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.post(reverse('certificate-issue'), {
+            'enrollment_id': next_enrollment.id,
+            'assessment_result_id': next_result.id,
+            'completion_date': date.today().isoformat(),
+        }, format='json')
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Certificate.objects.count(), 2)
+        self.assertTrue(Certificate.objects.filter(enrollment=next_enrollment).exists())
 
     @patch('certificates.pdf_generator.CertificatePDFGenerator')
     def test_adult_learner_receives_certificate_notification(self, generator_cls):
@@ -793,6 +1026,32 @@ class CertificateAPITests(CertificateModelTests):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(self._response_bytes(response).startswith(b'%PDF'))
         generator_cls.assert_called_once()
+        cert.refresh_from_db()
+        self.assertTrue(cert.pdf_file.storage.exists(cert.pdf_file.name))
+
+    def test_download_regenerated_pdf_uses_director_signature_when_available(self):
+        from .pdf_generator import CertificatePDFGenerator
+
+        branding = CertificateBranding.objects.create()
+        branding.director_signature.save('download-director.png', ContentFile(TINY_PNG), save=True)
+        cert = Certificate.objects.create(
+            student=self.student,
+            enrollment=self.enrollment,
+            course=self.course,
+            completion_date=date.today(),
+            status=Certificate.STATUS_ISSUED,
+            issued_by=self.admin_user,
+        )
+        cert.qr_code.save('download-qr.png', ContentFile(TINY_PNG), save=True)
+        self.client.force_authenticate(self.student_user)
+
+        with patch.object(CertificatePDFGenerator, '_draw_signature_block', autospec=True) as signature_block:
+            response = self.client.get(reverse('certificate-download', args=[cert.id]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self._response_bytes(response).startswith(b'%PDF'))
+        signature_block.assert_called_once()
+        self.assertIsNotNone(signature_block.call_args.args[7])
         cert.refresh_from_db()
         self.assertTrue(cert.pdf_file.storage.exists(cert.pdf_file.name))
 
