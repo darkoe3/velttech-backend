@@ -1546,6 +1546,10 @@ class InstructorDashboardView(APIView):
         active_enrollments = enrollments.filter(status=Enrollment.STATUS_ACTIVE).count()
         recent_enrollments = enrollments.order_by('-created_at')[:5]
         notifications = visible_notifications_for(request.user)[:5]
+        assessment_results = AssessmentResult.objects.filter(enrollment__in=enrollments)
+        learning_resources = LearningResource.objects.filter(course__enrollments__in=enrollments).distinct()
+        if request.user.role != User.ROLE_ADMIN:
+            learning_resources = learning_resources.filter(instructor=request.user)
         attendance = Attendance.objects.filter(
             enrollment__in=enrollments,
         ).select_related(
@@ -1590,6 +1594,18 @@ class InstructorDashboardView(APIView):
                 'total_assigned_courses': courses,
                 'total_assigned_students': students,
                 'active_enrollments': active_enrollments,
+                'assessment_summary': {
+                    'total': assessment_results.count(),
+                    'incomplete': assessment_results.filter(status=AssessmentResult.STATUS_INCOMPLETE).count(),
+                    'ready_for_review': assessment_results.filter(status=AssessmentResult.STATUS_READY_FOR_REVIEW).count(),
+                    'approved': assessment_results.filter(status=AssessmentResult.STATUS_APPROVED).count(),
+                    'certificate_issued': assessment_results.filter(status=AssessmentResult.STATUS_CERTIFICATE_ISSUED).count(),
+                },
+                'resource_summary': {
+                    'total': learning_resources.count(),
+                    'published': learning_resources.filter(is_published=True).count(),
+                    'draft': learning_resources.filter(is_published=False).count(),
+                },
                 'recent_enrollments': InstructorEnrollmentSerializer(
                     recent_enrollments,
                     many=True,
