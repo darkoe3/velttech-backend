@@ -155,6 +155,66 @@ class ProgressReport(models.Model):
         return f'{self.enrollment} - {self.progress_score}%'
 
 
+class LearningResource(models.Model):
+    RESOURCE_DOCUMENT = 'document'
+    RESOURCE_VIDEO = 'video'
+    RESOURCE_WEBSITE = 'website'
+    RESOURCE_GITHUB = 'github'
+    RESOURCE_NOTE = 'note'
+    RESOURCE_OTHER = 'other'
+
+    RESOURCE_TYPE_CHOICES = [
+        (RESOURCE_DOCUMENT, 'Document'),
+        (RESOURCE_VIDEO, 'Video'),
+        (RESOURCE_WEBSITE, 'Website'),
+        (RESOURCE_GITHUB, 'GitHub'),
+        (RESOURCE_NOTE, 'Note'),
+        (RESOURCE_OTHER, 'Other'),
+    ]
+
+    title = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    resource_type = models.CharField(
+        max_length=20,
+        choices=RESOURCE_TYPE_CHOICES,
+        default=RESOURCE_DOCUMENT,
+    )
+    url = models.URLField(blank=True)
+    course = models.ForeignKey(
+        'courses.Course',
+        on_delete=models.CASCADE,
+        related_name='learning_resources',
+    )
+    instructor = models.ForeignKey(
+        'users.User',
+        on_delete=models.CASCADE,
+        related_name='learning_resources',
+        limit_choices_to={'role': 'instructor'},
+    )
+    target_student = models.ForeignKey(
+        'students.Student',
+        on_delete=models.CASCADE,
+        related_name='targeted_learning_resources',
+        blank=True,
+        null=True,
+    )
+    is_published = models.BooleanField(default=False)
+    published_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-published_at', '-created_at']
+
+    def __str__(self):
+        return f'{self.course} - {self.title}'
+
+    def save(self, *args, **kwargs):
+        if self.is_published and self.published_at is None:
+            self.published_at = timezone.now()
+        super().save(*args, **kwargs)
+
+
 class AssessmentResult(models.Model):
     STATUS_INCOMPLETE = 'incomplete'
     STATUS_READY_FOR_REVIEW = 'ready_for_review'

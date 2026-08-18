@@ -31,6 +31,7 @@ from enrollments.models import (
     AssessmentResult,
     Attendance,
     Enrollment,
+    LearningResource,
     LessonNote,
     ProgressReport,
 )
@@ -73,6 +74,7 @@ from enrollments.serializers import (
     EnrollmentSerializer,
     LessonNoteSerializer,
     GradeAssignmentSubmissionSerializer,
+    LearningResourceSerializer,
     MyAssignmentSerializer,
     PublicAssessmentSerializer,
     ProgressReportSerializer,
@@ -1719,6 +1721,116 @@ class InstructorProgressReportsView(generics.ListCreateAPIView):
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+
+
+class InstructorLearningResourcesView(generics.ListCreateAPIView):
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
+    serializer_class = LearningResourceSerializer
+
+    def get_queryset(self):
+        queryset = LearningResource.objects.select_related(
+            'course',
+            'instructor',
+            'target_student',
+        )
+        if self.request.user.role != User.ROLE_ADMIN:
+            queryset = queryset.filter(instructor=self.request.user)
+
+        course = self.request.query_params.get('course')
+        resource_type = self.request.query_params.get('resource_type') or self.request.query_params.get('type')
+        published = self.request.query_params.get('is_published') or self.request.query_params.get('published')
+        if course:
+            queryset = queryset.filter(course_id=course)
+        if resource_type:
+            queryset = queryset.filter(resource_type=resource_type)
+        if published not in [None, '']:
+            if str(published).lower() in ['true', '1', 'yes', 'published']:
+                queryset = queryset.filter(is_published=True)
+            elif str(published).lower() in ['false', '0', 'no', 'draft']:
+                queryset = queryset.filter(is_published=False)
+        return queryset
+
+    def perform_create(self, serializer):
+        if self.request.user.role == User.ROLE_ADMIN:
+            serializer.save()
+        else:
+            serializer.save(instructor=self.request.user)
+
+
+class InstructorLearningResourceDetailView(generics.RetrieveUpdateDestroyAPIView):
+    permission_classes = [permissions.IsAuthenticated, IsInstructorOrAdminRole]
+    serializer_class = LearningResourceSerializer
+    http_method_names = ['get', 'patch', 'delete']
+
+    def get_queryset(self):
+        queryset = LearningResource.objects.select_related(
+            'course',
+            'instructor',
+            'target_student',
+        )
+        if self.request.user.role == User.ROLE_ADMIN:
+            return queryset
+        return queryset.filter(instructor=self.request.user)
+
+    def perform_update(self, serializer):
+        if self.request.user.role == User.ROLE_ADMIN:
+            serializer.save()
+        else:
+            serializer.save(instructor=self.request.user)
+
+
+class MyLearningResourcesView(generics.ListAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = LearningResourceSerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        enforce_student_approved(user)
+        queryset = LearningResource.objects.select_related(
+            'course',
+            'instructor',
+            'target_student',
+        ).filter(is_published=True)
+
+        course = self.request.query_params.get('course')
+        child = self.request.query_params.get('child') or self.request.query_params.get('student')
+        resource_type = self.request.query_params.get('resource_type') or self.request.query_params.get('type')
+        if course:
+            queryset = queryset.filter(course_id=course)
+        if resource_type:
+            queryset = queryset.filter(resource_type=resource_type)
+
+        if user.role == User.ROLE_ADMIN:
+            if child:
+                queryset = queryset.filter(
+                    course__enrollments__student_id=child,
+                ).filter(
+                    Q(target_student__isnull=True) | Q(target_student_id=child)
+                )
+            return queryset.distinct()
+
+        if user.role == User.ROLE_PARENT:
+            child_queryset = Student.objects.filter(parent__user=user)
+            if child:
+                child_queryset = child_queryset.filter(pk=child)
+            child_ids = child_queryset.values_list('id', flat=True)
+            return queryset.filter(
+                course__enrollments__student_id__in=child_ids,
+            ).filter(
+                Q(target_student__isnull=True) | Q(target_student_id__in=child_ids)
+            ).distinct()
+
+        if user.role == User.ROLE_STUDENT:
+            student = getattr(user, 'student_profile', None)
+            if not student:
+                return queryset.none()
+            return queryset.filter(
+                course__enrollments__student=student,
+            ).filter(
+                Q(target_student__isnull=True) | Q(target_student=student)
+            ).distinct()
+
+        return queryset.none()
 
 
 def instructor_assessment_results_queryset(user):

@@ -5,7 +5,7 @@ from courses.serializers import CourseSerializer
 from students.serializers import StudentSerializer
 from users.serializers import UserSerializer
 
-from .models import Assignment, AssignmentQuestion, AssignmentSubmission, AssessmentResult, Attendance, Enrollment, LessonNote, ProgressReport
+from .models import Assignment, AssignmentQuestion, AssignmentSubmission, AssessmentResult, Attendance, Enrollment, LearningResource, LessonNote, ProgressReport
 
 
 class EnrollmentSerializer(serializers.ModelSerializer):
@@ -131,6 +131,100 @@ class ProgressReportSerializer(serializers.ModelSerializer):
         if request.user.role == 'instructor' and value.instructor_id != request.user.id:
             raise serializers.ValidationError('You can only create reports for your assigned enrollments.')
         return value
+
+
+class LearningResourceSerializer(serializers.ModelSerializer):
+    course_title = serializers.CharField(source='course.title', read_only=True)
+    instructor_name = serializers.SerializerMethodField()
+    target_student_name = serializers.SerializerMethodField()
+    target_label = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LearningResource
+        fields = [
+            'id',
+            'title',
+            'description',
+            'resource_type',
+            'url',
+            'course',
+            'course_title',
+            'instructor',
+            'instructor_name',
+            'target_student',
+            'target_student_name',
+            'target_label',
+            'is_published',
+            'published_at',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['published_at', 'created_at', 'updated_at']
+        extra_kwargs = {'instructor': {'required': False}}
+
+    def get_instructor_name(self, obj):
+        return f'{obj.instructor.first_name} {obj.instructor.last_name}'.strip() or obj.instructor.email
+
+    def get_target_student_name(self, obj):
+        return str(obj.target_student) if obj.target_student else ''
+
+    def get_target_label(self, obj):
+        return str(obj.target_student) if obj.target_student else 'Entire course'
+
+    def validate_instructor(self, value):
+        request = self.context['request']
+        if request.user.role == 'instructor':
+            return request.user
+        if value.role != 'instructor':
+            raise serializers.ValidationError('Assigned user must have the instructor role.')
+        return value
+
+    def validate_url(self, value):
+        if value and not value.lower().startswith(('http://', 'https://')):
+            raise serializers.ValidationError('Enter a valid http:// or https:// URL.')
+        return value
+
+    def validate_course(self, value):
+        request = self.context['request']
+        if request.user.role == 'instructor' and not value.enrollments.filter(
+            instructor=request.user
+        ).exists():
+            raise serializers.ValidationError('You can only create resources for your assigned courses.')
+        return value
+
+    def validate(self, attrs):
+        request = self.context['request']
+        if request.user.role == 'instructor':
+            attrs['instructor'] = request.user
+        elif not attrs.get('instructor') and not getattr(self.instance, 'instructor_id', None):
+            raise serializers.ValidationError({'instructor': 'Select an instructor for this resource.'})
+
+        resource_type = attrs.get('resource_type') or getattr(self.instance, 'resource_type', LearningResource.RESOURCE_DOCUMENT)
+        description = (attrs.get('description', getattr(self.instance, 'description', '')) or '').strip()
+        url = (attrs.get('url', getattr(self.instance, 'url', '')) or '').strip()
+        course = attrs.get('course') or getattr(self.instance, 'course', None)
+        target_student = attrs.get('target_student')
+        if 'target_student' not in attrs and self.instance:
+            target_student = self.instance.target_student
+
+        if resource_type == LearningResource.RESOURCE_NOTE:
+            if not description:
+                raise serializers.ValidationError({'description': 'Description is required for note resources.'})
+        elif not url:
+            raise serializers.ValidationError({'url': 'URL is required for this resource type.'})
+
+        if target_student and course:
+            if not target_student.enrollments.filter(course=course).exists():
+                raise serializers.ValidationError({
+                    'target_student': 'Selected learner must be enrolled in the selected course.'
+                })
+            if request.user.role == 'instructor' and not target_student.enrollments.filter(
+                course=course,
+                instructor=request.user,
+            ).exists():
+                raise PermissionDenied('You can only target learners assigned to you for this course.')
+
+        return attrs
 
 
 class AssignmentQuestionSerializer(serializers.ModelSerializer):

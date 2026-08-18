@@ -7,6 +7,7 @@ from .models import (
     AssessmentResult,
     Attendance,
     Enrollment,
+    LearningResource,
     LessonNote,
     ProgressReport,
 )
@@ -43,6 +44,28 @@ class ProgressReportAdmin(admin.ModelAdmin):
     list_display = ('enrollment', 'progress_score', 'created_by', 'created_at')
     list_filter = ('progress_score', 'created_at')
     search_fields = ('enrollment__student__first_name', 'enrollment__student__last_name')
+
+
+@admin.register(LearningResource)
+class LearningResourceAdmin(admin.ModelAdmin):
+    list_display = (
+        'title',
+        'course',
+        'instructor',
+        'target_student',
+        'resource_type',
+        'is_published',
+        'published_at',
+    )
+    list_filter = ('course', 'instructor', 'resource_type', 'is_published')
+    search_fields = (
+        'title',
+        'description',
+        'course__title',
+        'instructor__email',
+        'target_student__first_name',
+        'target_student__last_name',
+    )
 
 
 @admin.register(AssessmentResult)

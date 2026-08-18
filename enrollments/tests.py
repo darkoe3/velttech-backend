@@ -17,10 +17,322 @@ from certificates.services import check_combined_result_certificate_eligibility
 from payments.models import Payment
 from students.models import Parent, Student
 
-from .models import Assignment, AssignmentQuestion, AssignmentSubmission, AssessmentResult, Enrollment
+from .models import Assignment, AssignmentQuestion, AssignmentSubmission, AssessmentResult, Enrollment, LearningResource
 
 
 User = get_user_model()
+
+
+@override_settings(SECURE_SSL_REDIRECT=False, MIDDLEWARE=[])
+class LearningResourceAPITests(APITestCase):
+    def setUp(self):
+        self.instructor = User.objects.create_user(
+            email='resource-instructor@example.com',
+            password='pass',
+            first_name='Resource',
+            last_name='Tutor',
+            role=User.ROLE_INSTRUCTOR,
+            approval_status=User.APPROVAL_APPROVED,
+        )
+        self.other_instructor = User.objects.create_user(
+            email='other-resource-instructor@example.com',
+            password='pass',
+            first_name='Other',
+            last_name='Tutor',
+            role=User.ROLE_INSTRUCTOR,
+            approval_status=User.APPROVAL_APPROVED,
+        )
+        self.admin = User.objects.create_user(
+            email='resource-admin@example.com',
+            password='pass',
+            first_name='Admin',
+            last_name='User',
+            role=User.ROLE_ADMIN,
+            approval_status=User.APPROVAL_APPROVED,
+        )
+        self.parent_user = User.objects.create_user(
+            email='resource-parent@example.com',
+            password='pass',
+            first_name='Parent',
+            last_name='User',
+            role=User.ROLE_PARENT,
+            approval_status=User.APPROVAL_APPROVED,
+        )
+        self.other_parent_user = User.objects.create_user(
+            email='other-resource-parent@example.com',
+            password='pass',
+            first_name='Other',
+            last_name='Parent',
+            role=User.ROLE_PARENT,
+            approval_status=User.APPROVAL_APPROVED,
+        )
+        self.adult_user = User.objects.create_user(
+            email='resource-adult@example.com',
+            password='pass',
+            first_name='Adult',
+            last_name='Learner',
+            role=User.ROLE_STUDENT,
+            account_type=User.ACCOUNT_ADULT_LEARNER,
+            approval_status=User.APPROVAL_APPROVED,
+        )
+        self.parent = Parent.objects.create(
+            user=self.parent_user,
+            first_name='Parent',
+            last_name='User',
+            email='resource-parent-profile@example.com',
+            phone_number='233555000001',
+        )
+        self.other_parent = Parent.objects.create(
+            user=self.other_parent_user,
+            first_name='Other',
+            last_name='Parent',
+            email='other-resource-parent-profile@example.com',
+            phone_number='233555000002',
+        )
+        self.student = Student.objects.create(
+            parent=self.parent,
+            first_name='Child',
+            last_name='Learner',
+            email='resource-child@example.com',
+            learner_type=Student.LEARNER_CHILD,
+            approval_status=Student.STATUS_APPROVED,
+        )
+        self.other_student = Student.objects.create(
+            parent=self.other_parent,
+            first_name='Other',
+            last_name='Learner',
+            email='other-resource-child@example.com',
+            learner_type=Student.LEARNER_CHILD,
+            approval_status=Student.STATUS_APPROVED,
+        )
+        self.adult_student = Student.objects.create(
+            user=self.adult_user,
+            first_name='Adult',
+            last_name='Learner',
+            email='resource-adult-profile@example.com',
+            learner_type=Student.LEARNER_ADULT,
+            approval_status=Student.STATUS_APPROVED,
+        )
+        self.course = Course.objects.create(
+            title='AI-Assisted Development',
+            description='Build with AI',
+            duration_months=2,
+            monthly_fee=100,
+            fee=200,
+        )
+        self.other_course = Course.objects.create(
+            title='Unassigned Course',
+            description='Other course',
+            duration_months=1,
+            monthly_fee=100,
+            fee=100,
+        )
+        self.enrollment = Enrollment.objects.create(
+            student=self.student,
+            course=self.course,
+            instructor=self.instructor,
+            status=Enrollment.STATUS_ACTIVE,
+        )
+        self.adult_enrollment = Enrollment.objects.create(
+            student=self.adult_student,
+            course=self.course,
+            instructor=self.instructor,
+            status=Enrollment.STATUS_ACTIVE,
+        )
+        self.other_enrollment = Enrollment.objects.create(
+            student=self.other_student,
+            course=self.other_course,
+            instructor=self.other_instructor,
+            status=Enrollment.STATUS_ACTIVE,
+        )
+
+    def list_url(self):
+        return reverse('instructor-resources')
+
+    def detail_url(self, resource):
+        return reverse('instructor-resource-detail', args=[resource.id])
+
+    def my_url(self):
+        return reverse('my-resources')
+
+    def payload(self, **overrides):
+        data = {
+            'title': 'Prompt Engineering Guide',
+            'description': 'Read before class.',
+            'resource_type': LearningResource.RESOURCE_DOCUMENT,
+            'url': 'https://drive.google.com/example',
+            'course': self.course.id,
+            'target_student': None,
+            'is_published': True,
+        }
+        data.update(overrides)
+        return data
+
+    def create_resource(self, **overrides):
+        data = self.payload(**overrides)
+        data['course'] = Course.objects.get(pk=data['course'])
+        target_student = data.get('target_student')
+        if target_student:
+            data['target_student'] = Student.objects.get(pk=target_student)
+        return LearningResource.objects.create(instructor=self.instructor, **data)
+
+    def test_instructor_creates_course_resource(self):
+        self.client.force_authenticate(self.instructor)
+        response = self.client.post(self.list_url(), self.payload(), format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        resource = LearningResource.objects.get(pk=response.data['id'])
+        self.assertEqual(resource.instructor, self.instructor)
+        self.assertIsNone(resource.target_student)
+        self.assertIsNotNone(resource.published_at)
+
+    def test_instructor_creates_individual_learner_resource(self):
+        self.client.force_authenticate(self.instructor)
+        response = self.client.post(
+            self.list_url(),
+            self.payload(target_student=self.student.id),
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['target_student'], self.student.id)
+
+    def test_instructor_cannot_use_unassigned_course(self):
+        self.client.force_authenticate(self.instructor)
+        response = self.client.post(
+            self.list_url(),
+            self.payload(course=self.other_course.id),
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_instructor_cannot_target_learner_outside_course(self):
+        self.client.force_authenticate(self.instructor)
+        response = self.client.post(
+            self.list_url(),
+            self.payload(target_student=self.other_student.id),
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_instructor_sees_own_resources_only(self):
+        own = self.create_resource(title='Own')
+        LearningResource.objects.create(
+            title='Other',
+            description='Other resource',
+            resource_type=LearningResource.RESOURCE_WEBSITE,
+            url='https://example.com/other',
+            course=self.other_course,
+            instructor=self.other_instructor,
+            is_published=True,
+        )
+        self.client.force_authenticate(self.instructor)
+        response = self.client.get(self.list_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual([item['id'] for item in response.data], [own.id])
+
+    def test_admin_sees_all_resources(self):
+        own = self.create_resource(title='Own')
+        other = LearningResource.objects.create(
+            title='Other',
+            description='Other resource',
+            resource_type=LearningResource.RESOURCE_WEBSITE,
+            url='https://example.com/other',
+            course=self.other_course,
+            instructor=self.other_instructor,
+            is_published=True,
+        )
+        self.client.force_authenticate(self.admin)
+        response = self.client.get(self.list_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual({item['id'] for item in response.data}, {own.id, other.id})
+
+    def test_parent_sees_published_resource_for_linked_child(self):
+        resource = self.create_resource()
+        self.client.force_authenticate(self.parent_user)
+        response = self.client.get(self.my_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual([item['id'] for item in response.data], [resource.id])
+
+    def test_parent_cannot_see_unrelated_child_resource(self):
+        LearningResource.objects.create(
+            title='Private',
+            description='Private note',
+            resource_type=LearningResource.RESOURCE_NOTE,
+            course=self.other_course,
+            instructor=self.other_instructor,
+            target_student=self.other_student,
+            is_published=True,
+        )
+        self.client.force_authenticate(self.parent_user)
+        response = self.client.get(self.my_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, [])
+
+    def test_adult_learner_sees_own_resource(self):
+        resource = self.create_resource(target_student=self.adult_student.id)
+        self.client.force_authenticate(self.adult_user)
+        response = self.client.get(self.my_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual([item['id'] for item in response.data], [resource.id])
+
+    def test_unpublished_resource_hidden_from_learner(self):
+        self.create_resource(is_published=False)
+        self.client.force_authenticate(self.parent_user)
+        response = self.client.get(self.my_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, [])
+
+    def test_note_resource_works_without_url(self):
+        self.client.force_authenticate(self.instructor)
+        response = self.client.post(
+            self.list_url(),
+            self.payload(
+                resource_type=LearningResource.RESOURCE_NOTE,
+                url='',
+                description='Bring your laptop.',
+            ),
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_non_note_requires_url(self):
+        self.client.force_authenticate(self.instructor)
+        response = self.client.post(self.list_url(), self.payload(url=''), format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('url', response.data)
+
+    def test_invalid_url_rejected(self):
+        self.client.force_authenticate(self.instructor)
+        response = self.client.post(
+            self.list_url(),
+            self.payload(url='javascript:alert(1)'),
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('url', response.data)
+
+    def test_delete_update_authorization(self):
+        resource = self.create_resource()
+        self.client.force_authenticate(self.other_instructor)
+        patch_response = self.client.patch(
+            self.detail_url(resource),
+            {'title': 'Changed'},
+            format='json',
+        )
+        delete_response = self.client.delete(self.detail_url(resource))
+        self.assertEqual(patch_response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(delete_response.status_code, status.HTTP_404_NOT_FOUND)
+        resource.refresh_from_db()
+        self.assertEqual(resource.title, 'Prompt Engineering Guide')
+
+        self.client.force_authenticate(self.instructor)
+        patch_response = self.client.patch(
+            self.detail_url(resource),
+            {'title': 'Changed'},
+            format='json',
+        )
+        self.assertEqual(patch_response.status_code, status.HTTP_200_OK)
+        delete_response = self.client.delete(self.detail_url(resource))
+        self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
 
 
 @override_settings(SECURE_SSL_REDIRECT=False, MIDDLEWARE=[])
